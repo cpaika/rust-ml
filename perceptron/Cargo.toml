@@ -5,4 +5,4 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-csv = "1"
+common = { path = "../common" }
