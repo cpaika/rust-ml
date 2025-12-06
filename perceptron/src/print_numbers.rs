@@ -1,49 +1,22 @@
-use csv::ReaderBuilder;
+use common::parse_digits;
 use std::error::Error;
-use std::fs::File;
 use std::path::PathBuf;
+
+const WIDTH: usize = 28;
+const HEIGHT: usize = 28;
 
 pub fn print_numbers(n: usize) -> Result<(), Box<dyn Error>> {
     let csv_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("digit-recognizer")
         .join("train.csv");
 
-    let file = File::open(&csv_path)?;
-    let mut reader = ReaderBuilder::new().has_headers(true).from_reader(file);
+    let digits = parse_digits(&csv_path)?;
 
-    for (i, result) in reader.records().enumerate() {
-        if i >= n {
-            break;
-        }
-
-        let record = result?;
-        let label: u8 = record.get(0).unwrap().parse()?;
-        let pixels: Vec<u8> = record
-            .iter()
-            .skip(1)
-            .map(|s| s.parse().unwrap_or(0))
-            .collect();
-
-        println!("=== Digit {} (sample {}) ===", label, i + 1);
-        print_digit(&pixels);
+    for (i, digit) in digits.iter().take(n).enumerate() {
+        println!("=== Digit {} (sample {}) ===", digit.label(), i + 1);
+        print!("{}", digit.to_ascii_art(WIDTH, HEIGHT));
         println!();
     }
 
     Ok(())
-}
-
-fn print_digit(pixels: &[u8]) {
-    const WIDTH: usize = 28;
-    const HEIGHT: usize = 28;
-
-    let chars = [' ', '░', '▒', '▓', '█'];
-
-    for row in 0..HEIGHT {
-        for col in 0..WIDTH {
-            let pixel = pixels[row * WIDTH + col];
-            let char_idx = (pixel as usize * (chars.len() - 1)) / 255;
-            print!("{}", chars[char_idx]);
-        }
-        println!();
-    }
 }

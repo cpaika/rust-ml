@@ -1,0 +1,30 @@
+[package]
+name = "numbers-browser"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+common = { path = "../common" }
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = [
+    "Document",
+    "Element",
+    "HtmlElement",
+    "HtmlCanvasElement",
+    "CanvasRenderingContext2d",
+    "CssStyleDeclaration",
+    "ImageData",
+    "Window",
+    "Node",
+    "Event",
+    "EventTarget",
+    "MouseEvent",
+    "WheelEvent",
+    "HtmlButtonElement",
+]}
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
