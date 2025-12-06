@@ -4,8 +4,22 @@
 use std::rc::Rc;
 
 pub struct NeuralNet {
-    layers: Vec<Layer>,
-    weights: Vec<Weight>,
+    pub layers: Vec<Layer>,
+    pub weights: Vec<Weight>,
+}
+
+impl NeuralNet {
+    pub fn forward_pass(input: &[u64]) -> &[u64] {
+        unimplemented!("TODO")
+    }
+
+    pub fn layers(&self) -> &[Layer] {
+        &self.layers
+    }
+
+    pub fn weights(&self) -> &[Weight] {
+        &self.weights
+    }
 }
 
 impl NeuralNet {
@@ -47,19 +61,37 @@ impl Layer {
 
 #[derive(Debug, Clone)]
 pub struct Neuron {
-    bias: usize,
+    pub bias: usize,
 }
 
 impl Neuron {
     pub fn new(bias: usize) -> Self {
         Neuron { bias }
     }
+
+    pub fn bias(&self) -> usize {
+        self.bias
+    }
 }
 
 pub struct Weight {
-    source: Rc<Neuron>,
-    destination: Rc<Neuron>,
-    weight: f64,
+    pub source: Rc<Neuron>,
+    pub destination: Rc<Neuron>,
+    pub weight: f64,
+}
+
+impl Weight {
+    pub fn weight(&self) -> f64 {
+        self.weight
+    }
+
+    pub fn source(&self) -> &Rc<Neuron> {
+        &self.source
+    }
+
+    pub fn destination(&self) -> &Rc<Neuron> {
+        &self.destination
+    }
 }
 
 #[cfg(test)]
