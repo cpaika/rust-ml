@@ -6,6 +6,10 @@ edition = "2024"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = []
+gpu = ["neural/gpu", "wgpu", "wasm-bindgen-futures"]
+
 [dependencies]
 neural = { path = "../libs/neural" }
 common = { path = "../libs/common" }
@@ -24,7 +28,14 @@ web-sys = { version = "0.3", features = [
     "MouseEvent",
     "WheelEvent",
     "HtmlButtonElement",
+    "Navigator",
+    "console",
 ]}
+js-sys = "0.3"
+# GPU dependencies (optional)
+wgpu = { version = "23", optional = true, features = ["webgpu"] }
+wasm-bindgen-futures = { version = "0.4", optional = true }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
+pollster = "0.4"

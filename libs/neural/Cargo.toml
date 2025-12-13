@@ -3,7 +3,22 @@ name = "neural"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+gpu = ["wgpu", "pollster", "bytemuck"]
+
 [dependencies]
 rand = "0.8"
 getrandom = { version = "0.2", features = ["js"] }
 common = { path = "../common" }
+
+# GPU dependencies (optional)
+wgpu = { version = "23", optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1.14", features = ["derive"], optional = true }
+
+[dev-dependencies]
+# For GPU tests
+wgpu = "23"
+pollster = "0.4"
+bytemuck = { version = "1.14", features = ["derive"] }

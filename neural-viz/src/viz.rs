@@ -3,6 +3,9 @@ use neural::{Network, mnist::MnistSample};
 use wasm_bindgen::prelude::*;
 use web_sys::{CanvasRenderingContext2d, Document, HtmlCanvasElement, HtmlElement, MouseEvent, WheelEvent};
 
+#[cfg(feature = "gpu")]
+use neural::GpuNetwork;
+
 const INPUT_PANEL_WIDTH: f64 = 200.0;
 const NEURON_RADIUS: f64 = 8.0;  // Smaller neurons
 const LAYER_SPACING: f64 = 250.0;
@@ -37,6 +40,20 @@ enum TrainingState {
     Idle,
     Training,
     Paused,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum AcceleratorMode {
+    Cpu,
+    Gpu,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum GpuInitState {
+    NotStarted,
+    Initializing,
+    Ready,
+    Failed,
 }
 
 struct TrainingMetrics {
@@ -91,10 +108,14 @@ struct State {
     // Current activations for visualization
     current_activations: Vec<Vec<f32>>,
     current_prediction: Option<usize>,
+    // Accelerator mode (CPU vs GPU)
+    accelerator_mode: AcceleratorMode,
+    gpu_available: bool,
+    gpu_init_state: GpuInitState,
 }
 
 impl State {
-    fn new(network: Network, digits: Vec<Digit>, canvas_width: f64, canvas_height: f64) -> Self {
+    fn new(network: Network, digits: Vec<Digit>, canvas_width: f64, canvas_height: f64, gpu_available: bool) -> Self {
         let neuron_positions = Self::calculate_positions(&network, canvas_width, canvas_height);
         let samples: Vec<MnistSample> = digits.iter().map(|d| MnistSample::new(d.clone())).collect();
         let num_layers = network.layer_sizes().len();
@@ -122,6 +143,9 @@ impl State {
             current_batch_idx: 0,
             current_activations: vec![Vec::new(); num_layers],
             current_prediction: None,
+            accelerator_mode: AcceleratorMode::Cpu, // Default to CPU
+            gpu_available,
+            gpu_init_state: GpuInitState::NotStarted,
         }
     }
 
@@ -296,6 +320,8 @@ impl State {
         self.current_batch_idx = 0;
         self.current_activations.clear();
         self.current_prediction = None;
+        // Reset GPU state - need to reinitialize after reset
+        self.gpu_init_state = GpuInitState::NotStarted;
     }
 
     fn train_batches(&mut self, num_batches: usize) {
@@ -372,6 +398,11 @@ thread_local! {
     static STATE: std::cell::RefCell<Option<State>> = const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(feature = "gpu")]
+thread_local! {
+    static GPU_NETWORK: std::cell::RefCell<Option<GpuNetwork>> = const { std::cell::RefCell::new(None) };
+}
+
 pub fn init(csv_data: &[u8]) -> Result<(), JsValue> {
     let digits = parse_digits_from_bytes(csv_data).map_err(|e| JsValue::from_str(&e.to_string()))?;
     let network = Network::mnist_default();
@@ -382,8 +413,11 @@ pub fn init(csv_data: &[u8]) -> Result<(), JsValue> {
     let canvas_width = window.inner_width()?.as_f64().unwrap_or(1200.0) - INPUT_PANEL_WIDTH;
     let canvas_height = window.inner_height()?.as_f64().unwrap_or(800.0);
 
+    // Check if WebGPU is available
+    let gpu_available = check_webgpu_available(&window);
+
     STATE.with(|state| {
-        *state.borrow_mut() = Some(State::new(network, digits, canvas_width, canvas_height));
+        *state.borrow_mut() = Some(State::new(network, digits, canvas_width, canvas_height, gpu_available));
     });
 
     setup_ui(&document, canvas_width as u32, canvas_height as u32)?;
@@ -399,6 +433,208 @@ pub fn init(csv_data: &[u8]) -> Result<(), JsValue> {
     render(&document)?;
 
     Ok(())
+}
+
+/// Check if WebGPU is available in the browser
+fn check_webgpu_available(_window: &web_sys::Window) -> bool {
+    // WebGPU availability check - the navigator.gpu property exists when WebGPU is supported
+    #[cfg(feature = "gpu")]
+    {
+        if let Some(window) = web_sys::window() {
+            let navigator = window.navigator();
+            // Check if gpu property exists on navigator
+            let gpu = js_sys::Reflect::get(&navigator, &"gpu".into());
+            if let Ok(gpu_val) = gpu {
+                return !gpu_val.is_undefined() && !gpu_val.is_null();
+            }
+        }
+        false
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        false // GPU feature not compiled in
+    }
+}
+
+/// Initialize GPU network asynchronously
+#[cfg(feature = "gpu")]
+fn init_gpu_async(document: Document) {
+    use wasm_bindgen_futures::spawn_local;
+
+    // Mark as initializing
+    STATE.with(|state| {
+        if let Some(ref mut s) = *state.borrow_mut() {
+            s.gpu_init_state = GpuInitState::Initializing;
+        }
+    });
+    let _ = update_gpu_button(&document);
+
+    // Clone network weights to initialize GPU network with same state
+    let network_clone = STATE.with(|state| {
+        state.borrow().as_ref().map(|s| s.network.clone())
+    });
+
+    let doc = document.clone();
+    spawn_local(async move {
+        if let Some(network) = network_clone {
+            match GpuNetwork::from_network_async(network).await {
+                Ok(gpu_net) => {
+                    // Store GPU network
+                    GPU_NETWORK.with(|gpu| {
+                        *gpu.borrow_mut() = Some(gpu_net);
+                    });
+
+                    // Mark as ready
+                    STATE.with(|state| {
+                        if let Some(ref mut s) = *state.borrow_mut() {
+                            s.gpu_init_state = GpuInitState::Ready;
+                        }
+                    });
+                    web_sys::console::log_1(&"GPU network initialized successfully".into());
+                }
+                Err(e) => {
+                    // Mark as failed
+                    STATE.with(|state| {
+                        if let Some(ref mut s) = *state.borrow_mut() {
+                            s.gpu_init_state = GpuInitState::Failed;
+                        }
+                    });
+                    web_sys::console::error_1(&format!("GPU initialization failed: {}", e).into());
+                }
+            }
+        }
+        let _ = update_gpu_button(&doc);
+    });
+}
+
+/// Sync CPU network weights to GPU network (if initialized)
+#[cfg(feature = "gpu")]
+#[allow(dead_code)]
+fn sync_network_to_gpu() {
+    STATE.with(|state| {
+        if let Some(ref s) = *state.borrow() {
+            GPU_NETWORK.with(|gpu| {
+                if let Some(ref mut gpu_net) = *gpu.borrow_mut() {
+                    // Copy weights from CPU network to GPU network
+                    let cpu_net = &s.network;
+                    for (gpu_layer, cpu_layer) in gpu_net.network_mut().layers.iter_mut().zip(cpu_net.layers.iter()) {
+                        gpu_layer.weights.copy_from_slice(&cpu_layer.weights);
+                        gpu_layer.biases.copy_from_slice(&cpu_layer.biases);
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// Sync GPU network weights back to CPU network
+#[cfg(feature = "gpu")]
+#[allow(dead_code)]
+fn sync_network_from_gpu() {
+    GPU_NETWORK.with(|gpu| {
+        if let Some(ref gpu_net) = *gpu.borrow() {
+            STATE.with(|state| {
+                if let Some(ref mut s) = *state.borrow_mut() {
+                    for (cpu_layer, gpu_layer) in s.network.layers.iter_mut().zip(gpu_net.network().layers.iter()) {
+                        cpu_layer.weights.copy_from_slice(&gpu_layer.weights);
+                        cpu_layer.biases.copy_from_slice(&gpu_layer.biases);
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// Train batches using GPU acceleration
+#[cfg(feature = "gpu")]
+fn train_batches_gpu(state: &mut State, num_batches: usize) {
+    let total_samples = state.samples.len();
+    let num_total_batches = total_samples / BATCH_SIZE;
+
+    GPU_NETWORK.with(|gpu| {
+        let mut gpu_borrow = gpu.borrow_mut();
+        let gpu_net = match gpu_borrow.as_mut() {
+            Some(g) => g,
+            None => {
+                web_sys::console::error_1(&"GPU network not initialized".into());
+                return;
+            }
+        };
+
+        for _ in 0..num_batches {
+            if state.training_state != TrainingState::Training {
+                break;
+            }
+
+            // Get batch
+            let start = state.current_batch_idx * BATCH_SIZE;
+            let end = (start + BATCH_SIZE).min(total_samples);
+
+            if start >= total_samples {
+                // End of epoch - sync weights back to CPU and update state
+                state.metrics.epoch += 1;
+                state.current_batch_idx = 0;
+
+                // Stop training if accuracy is good enough or max epochs reached
+                if state.metrics.accuracy >= 0.99 || state.metrics.epoch >= 10 {
+                    state.training_state = TrainingState::Paused;
+                    // Sync final weights back to CPU for visualization
+                    for (cpu_layer, gpu_layer) in state.network.layers.iter_mut().zip(gpu_net.network().layers.iter()) {
+                        cpu_layer.weights.copy_from_slice(&gpu_layer.weights);
+                        cpu_layer.biases.copy_from_slice(&gpu_layer.biases);
+                    }
+                    break;
+                }
+
+                // Shuffle samples for next epoch
+                use rand::seq::SliceRandom;
+                let mut rng = rand::thread_rng();
+                state.samples.shuffle(&mut rng);
+                continue;
+            }
+
+            let inputs: Vec<Vec<f32>> = state.samples[start..end]
+                .iter()
+                .map(|s| s.normalized_pixels_f32())
+                .collect();
+            let labels: Vec<u8> = state.samples[start..end].iter().map(|s| s.label()).collect();
+
+            // Train batch on GPU
+            let loss = gpu_net.train_batch(&inputs, &labels, LEARNING_RATE);
+
+            // Update metrics
+            state.metrics.batch = state.current_batch_idx;
+            state.metrics.total_batches = num_total_batches;
+            state.metrics.samples_seen += inputs.len();
+            state.metrics.loss = loss;
+            state.metrics.loss_history.push(loss);
+
+            // Evaluate accuracy periodically (every 10 batches) using CPU network
+            // First sync weights from GPU to CPU for evaluation
+            if state.current_batch_idx % 10 == 0 {
+                // Sync GPU weights to CPU for evaluation
+                for (cpu_layer, gpu_layer) in state.network.layers.iter_mut().zip(gpu_net.network().layers.iter()) {
+                    cpu_layer.weights.copy_from_slice(&gpu_layer.weights);
+                    cpu_layer.biases.copy_from_slice(&gpu_layer.biases);
+                }
+
+                let val_size = 500;
+                let val_start = state.digits.len().saturating_sub(val_size);
+                let eval_inputs: Vec<Vec<f32>> = state.digits[val_start..]
+                    .iter()
+                    .map(|d| d.pixels().iter().map(|&p| p as f32 / 255.0).collect())
+                    .collect();
+                let eval_labels: Vec<u8> = state.digits[val_start..]
+                    .iter()
+                    .map(|d| d.label())
+                    .collect();
+                let (_, acc) = state.network.evaluate(&eval_inputs, &eval_labels);
+                state.metrics.accuracy = acc;
+            }
+
+            state.current_batch_idx += 1;
+        }
+    });
 }
 
 fn setup_ui(document: &Document, canvas_width: u32, canvas_height: u32) -> Result<(), JsValue> {
@@ -466,6 +702,33 @@ fn setup_ui(document: &Document, canvas_width: u32, canvas_height: u32) -> Resul
         ),
     )?;
     controls_section.append_child(&reset_btn)?;
+
+    // GPU Toggle Button
+    let gpu_btn = document.create_element("button")?;
+    gpu_btn.set_id("gpu-btn");
+    gpu_btn.set_text_content(Some("CPU Mode"));
+    gpu_btn.set_attribute(
+        "style",
+        &format!(
+            "width: 100%; padding: 10px; font-size: 13px; cursor: pointer; \
+             background: #1a2a3a; color: {}; border: 1px solid {}; border-radius: 8px; \
+             transition: all 0.2s; margin-top: 8px;",
+            TEXT_COLOR, NEURON_STROKE
+        ),
+    )?;
+    controls_section.append_child(&gpu_btn)?;
+
+    // GPU Status indicator
+    let gpu_status = document.create_element("div")?;
+    gpu_status.set_id("gpu-status");
+    gpu_status.set_attribute(
+        "style",
+        &format!(
+            "color: {}; font-size: 11px; text-align: center; padding: 4px;",
+            TEXT_DIM
+        ),
+    )?;
+    controls_section.append_child(&gpu_status)?;
 
     left_panel.append_child(&controls_section)?;
 
@@ -787,7 +1050,13 @@ fn setup_handlers(document: &Document) -> Result<(), JsValue> {
                 s.reset_network();
             }
         });
+        // Clear GPU network on reset
+        #[cfg(feature = "gpu")]
+        GPU_NETWORK.with(|gpu| {
+            *gpu.borrow_mut() = None;
+        });
         let _ = update_train_button(&doc_clone);
+        let _ = update_gpu_button(&doc_clone);
         let _ = update_metrics(&doc_clone);
         let _ = render_loss_chart(&doc_clone);
         let _ = render(&doc_clone);
@@ -816,6 +1085,54 @@ fn setup_handlers(document: &Document) -> Result<(), JsValue> {
         .dyn_into::<HtmlElement>()?
         .set_onclick(Some(scale_closure.as_ref().unchecked_ref()));
     scale_closure.forget();
+
+    // GPU toggle button
+    let doc_clone = document.clone();
+    let gpu_closure = Closure::wrap(Box::new(move |_event: MouseEvent| {
+        let (is_training, current_mode, gpu_available, gpu_init_state) = STATE.with(|state| {
+            if let Some(ref s) = *state.borrow() {
+                (s.training_state == TrainingState::Training, s.accelerator_mode, s.gpu_available, s.gpu_init_state)
+            } else {
+                (false, AcceleratorMode::Cpu, false, GpuInitState::NotStarted)
+            }
+        });
+
+        // Don't allow switching while training
+        if is_training {
+            return;
+        }
+
+        // Toggle mode
+        let new_mode = match current_mode {
+            AcceleratorMode::Cpu => AcceleratorMode::Gpu,
+            AcceleratorMode::Gpu => AcceleratorMode::Cpu,
+        };
+
+        STATE.with(|state| {
+            if let Some(ref mut s) = *state.borrow_mut() {
+                s.accelerator_mode = new_mode;
+            }
+        });
+
+        // If switching to GPU and not initialized yet, start async initialization
+        #[cfg(feature = "gpu")]
+        {
+            if new_mode == AcceleratorMode::Gpu && gpu_available && gpu_init_state == GpuInitState::NotStarted {
+                init_gpu_async(doc_clone.clone());
+            }
+        }
+
+        let _ = update_gpu_button(&doc_clone);
+    }) as Box<dyn Fn(MouseEvent)>);
+    document
+        .get_element_by_id("gpu-btn")
+        .ok_or("no gpu button")?
+        .dyn_into::<HtmlElement>()?
+        .set_onclick(Some(gpu_closure.as_ref().unchecked_ref()));
+    gpu_closure.forget();
+
+    // Initialize GPU button state
+    update_gpu_button(document)?;
 
     // Digit canvas mouse handlers (for weight visualization on hover)
     let digit_canvas = document
@@ -876,7 +1193,21 @@ fn start_training_loop(document: Document) {
         let is_training = STATE.with(|state| {
             if let Some(ref mut s) = *state.borrow_mut() {
                 if s.training_state == TrainingState::Training {
-                    s.train_batches(BATCHES_PER_FRAME);
+                    // Check if we should use GPU training
+                    #[cfg(feature = "gpu")]
+                    let use_gpu = s.accelerator_mode == AcceleratorMode::Gpu
+                        && s.gpu_init_state == GpuInitState::Ready;
+                    #[cfg(not(feature = "gpu"))]
+                    let use_gpu = false;
+
+                    if use_gpu {
+                        #[cfg(feature = "gpu")]
+                        {
+                            train_batches_gpu(s, BATCHES_PER_FRAME);
+                        }
+                    } else {
+                        s.train_batches(BATCHES_PER_FRAME);
+                    }
                     true
                 } else {
                     false
@@ -930,6 +1261,54 @@ fn update_scale_button(document: &Document) -> Result<(), JsValue> {
         if let Some(ref s) = *state {
             let text = if s.metrics.log_scale { "Log Scale" } else { "Linear Scale" };
             btn.set_text_content(Some(text));
+        }
+    });
+
+    Ok(())
+}
+
+fn update_gpu_button(document: &Document) -> Result<(), JsValue> {
+    let btn = document.get_element_by_id("gpu-btn").ok_or("no gpu button")?;
+    let status = document.get_element_by_id("gpu-status").ok_or("no gpu status")?;
+
+    STATE.with(|state| {
+        let state = state.borrow();
+        if let Some(ref s) = *state {
+            let (text, bg_color, border_color) = match s.accelerator_mode {
+                AcceleratorMode::Cpu => ("CPU Mode", "#1a2a3a", NEURON_STROKE),
+                AcceleratorMode::Gpu => {
+                    match s.gpu_init_state {
+                        GpuInitState::NotStarted => ("GPU Mode", "#1a3a4a", NEURON_STROKE),
+                        GpuInitState::Initializing => ("GPU Init...", "#2a3a4a", "#f0ad4e"),
+                        GpuInitState::Ready => ("GPU Mode", "#1a4a3a", ACCENT_COLOR),
+                        GpuInitState::Failed => ("GPU Mode", "#4a2a2a", ACCENT_SECONDARY),
+                    }
+                }
+            };
+
+            btn.set_text_content(Some(text));
+            let btn_el = btn.dyn_ref::<HtmlElement>().unwrap();
+            let _ = btn_el.style().set_property("background", bg_color);
+            let _ = btn_el.style().set_property("border-color", border_color);
+
+            // Update status text based on mode and GPU state
+            let (status_text, status_color) = match s.accelerator_mode {
+                AcceleratorMode::Cpu => ("Training on CPU".to_string(), TEXT_DIM),
+                AcceleratorMode::Gpu => {
+                    if !s.gpu_available {
+                        ("WebGPU not available".to_string(), ACCENT_SECONDARY)
+                    } else {
+                        match s.gpu_init_state {
+                            GpuInitState::NotStarted => ("Click to initialize GPU".to_string(), TEXT_DIM),
+                            GpuInitState::Initializing => ("Initializing WebGPU...".to_string(), "#f0ad4e"),
+                            GpuInitState::Ready => ("WebGPU ready".to_string(), ACCENT_COLOR),
+                            GpuInitState::Failed => ("GPU init failed".to_string(), ACCENT_SECONDARY),
+                        }
+                    }
+                }
+            };
+            status.set_text_content(Some(&status_text));
+            let _ = status.dyn_ref::<HtmlElement>().unwrap().style().set_property("color", status_color);
         }
     });
 
