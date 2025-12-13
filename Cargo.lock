@@ -226,6 +226,7 @@ dependencies = [
 name = "neural"
 version = "0.1.0"
 dependencies = [
+ "common",
  "getrandom",
  "rand",
 ]

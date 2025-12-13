@@ -70,17 +70,19 @@ impl State {
 
     fn calculate_positions(network: &NeuralNet, canvas_width: f64, canvas_height: f64) -> Vec<NeuronPosition> {
         let mut positions = Vec::new();
-        let layers = network.layers();
-        let num_layers = layers.len();
+
+        // Collect all layers: input, hidden layers, output
+        let all_layers = Self::get_all_layers(network);
+        let num_layers = all_layers.len();
 
         // Find max neurons in any layer for scaling
-        let max_neurons = layers.iter().map(|l| l.neurons.len()).max().unwrap_or(1);
+        let max_neurons = all_layers.iter().map(|l| l.neurons.len()).max().unwrap_or(1);
 
         // Calculate spacing to fit all neurons with padding
         let available_height = canvas_height - 100.0; // padding top and bottom
         let neuron_spacing = (available_height / max_neurons as f64).min(NEURON_RADIUS * 3.0);
 
-        for (layer_idx, layer) in layers.iter().enumerate() {
+        for (layer_idx, layer) in all_layers.iter().enumerate() {
             let num_neurons = layer.neurons.len();
             let layer_x = INPUT_PANEL_WIDTH + 100.0 + (layer_idx as f64) * LAYER_SPACING;
 
@@ -100,6 +102,13 @@ impl State {
         }
 
         positions
+    }
+
+    fn get_all_layers(network: &NeuralNet) -> Vec<&neural::Layer> {
+        let mut layers = vec![&network.input_layer];
+        layers.extend(network.hidden_layers.iter());
+        layers.push(&network.output_layer);
+        layers
     }
 
     fn screen_to_world(&self, screen_x: f64, screen_y: f64) -> (f64, f64) {
@@ -177,7 +186,7 @@ pub fn init(csv_data: &[u8]) -> Result<(), JsValue> {
     let digits =
         parse_digits_from_bytes(csv_data).map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-    let network = NeuralNet::new(3, 28);
+    let network = NeuralNet::new(784, 3, 28, 10);
 
     let window = web_sys::window().ok_or("no window")?;
     let document = window.document().ok_or("no document")?;
@@ -485,7 +494,8 @@ fn update_tooltip(document: &Document, mouse_x: f64, mouse_y: f64) -> Result<(),
         let state = state.borrow();
         if let Some(ref s) = *state {
             if let Some((layer_idx, neuron_idx)) = s.hovered_neuron {
-                let neuron = &s.network.layers()[layer_idx].neurons[neuron_idx];
+                let all_layers = State::get_all_layers(&s.network);
+                let neuron = &all_layers[layer_idx].neurons[neuron_idx];
 
                 // Count weights connected to this neuron
                 let mut incoming_weights = Vec::new();
@@ -500,11 +510,13 @@ fn update_tooltip(document: &Document, mouse_x: f64, mouse_y: f64) -> Result<(),
                     }
                 }
 
-                let layer_name = match layer_idx {
-                    0 => "Input Layer",
-                    1 => "Hidden Layer",
-                    2 => "Output Layer",
-                    _ => "Layer",
+                let num_layers = all_layers.len();
+                let layer_name = if layer_idx == 0 {
+                    "Input Layer"
+                } else if layer_idx == num_layers - 1 {
+                    "Output Layer"
+                } else {
+                    "Hidden Layer"
                 };
 
                 let mut html = format!(
@@ -633,8 +645,16 @@ fn render(document: &Document) -> Result<(), JsValue> {
         // Draw layer labels
         ctx.set_fill_style_str(TEXT_COLOR);
         ctx.set_font("16px 'Segoe UI', sans-serif");
-        let labels = ["Input Layer", "Hidden Layer", "Output Layer"];
-        for (i, label) in labels.iter().enumerate() {
+        let all_layers = State::get_all_layers(&state.network);
+        let num_layers = all_layers.len();
+        for i in 0..num_layers {
+            let label = if i == 0 {
+                "Input Layer"
+            } else if i == num_layers - 1 {
+                "Output Layer"
+            } else {
+                "Hidden Layer"
+            };
             if let Some((x, _)) = state.get_position(i, 0) {
                 ctx.set_text_align("center");
                 let _ = ctx.fill_text(label, x, 30.0);
@@ -649,7 +669,7 @@ fn render(document: &Document) -> Result<(), JsValue> {
             let mut source_pos = None;
             let mut dest_pos = None;
 
-            for (layer_idx, layer) in state.network.layers().iter().enumerate() {
+            for (layer_idx, layer) in all_layers.iter().enumerate() {
                 for (neuron_idx, neuron) in layer.neurons.iter().enumerate() {
                     if Rc::ptr_eq(neuron, weight.source()) {
                         source_pos = state.get_position(layer_idx, neuron_idx);
@@ -663,7 +683,7 @@ fn render(document: &Document) -> Result<(), JsValue> {
             if let (Some((x1, y1)), Some((x2, y2))) = (source_pos, dest_pos) {
                 // Check if this weight connects to hovered neuron
                 let is_connected = hovered.map_or(false, |(layer_idx, neuron_idx)| {
-                    let hovered_neuron = &state.network.layers()[layer_idx].neurons[neuron_idx];
+                    let hovered_neuron = &all_layers[layer_idx].neurons[neuron_idx];
                     Rc::ptr_eq(weight.source(), hovered_neuron)
                         || Rc::ptr_eq(weight.destination(), hovered_neuron)
                 });

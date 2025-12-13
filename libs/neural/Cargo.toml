@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 rand = "0.8"
 getrandom = { version = "0.2", features = ["js"] }
+common = { path = "../common" }
