@@ -4,8 +4,8 @@ use wasm_bindgen::prelude::*;
 use web_sys::{CanvasRenderingContext2d, Document, HtmlCanvasElement, HtmlElement, MouseEvent, WheelEvent};
 
 const INPUT_PANEL_WIDTH: f64 = 200.0;
-const NEURON_RADIUS: f64 = 12.0;
-const LAYER_SPACING: f64 = 300.0;
+const NEURON_RADIUS: f64 = 8.0;  // Smaller neurons
+const LAYER_SPACING: f64 = 250.0;
 
 // Modern color palette
 const BG_COLOR: &str = "#0a0a0f";
@@ -72,6 +72,8 @@ struct State {
     current_digit_idx: Option<usize>,
     neuron_positions: Vec<NeuronPosition>,
     hovered_neuron: Option<(usize, usize)>,
+    // Hover from digit canvas (left panel) - pixel index 0-783
+    hovered_digit_pixel: Option<usize>,
     mouse_x: f64,
     mouse_y: f64,
     canvas_width: f64,
@@ -104,6 +106,7 @@ impl State {
             current_digit_idx: None,
             neuron_positions,
             hovered_neuron: None,
+            hovered_digit_pixel: None,
             mouse_x: 0.0,
             mouse_y: 0.0,
             canvas_width,
@@ -126,33 +129,64 @@ impl State {
         let mut positions = Vec::new();
         let layer_sizes = network.layer_sizes();
 
-        // Cap display at 50 per layer for performance
-        let display_sizes: Vec<usize> = layer_sizes.iter().map(|&s| s.min(50)).collect();
-
         let available_height = canvas_height - 100.0;
 
-        for (layer_idx, &display_size) in display_sizes.iter().enumerate() {
-            let layer_x = INPUT_PANEL_WIDTH + 100.0 + (layer_idx as f64) * LAYER_SPACING;
+        for (layer_idx, &actual_size) in layer_sizes.iter().enumerate() {
+            if layer_idx == 0 {
+                // Input layer: 28x28 grid
+                let grid_size = 28;
+                let cell_size = 4.0; // 4px per cell
+                let grid_height = grid_size as f64 * cell_size;
+                let grid_x = INPUT_PANEL_WIDTH + 100.0;
+                let grid_y = (canvas_height - grid_height) / 2.0;
 
-            // Calculate spacing for THIS layer - smaller layers get more spacing
-            // Min spacing of 3x radius, max based on available height
-            let layer_spacing = if display_size > 1 {
-                (available_height / (display_size - 1) as f64).min(NEURON_RADIUS * 4.0)
+                for neuron_idx in 0..actual_size {
+                    let row = neuron_idx / grid_size;
+                    let col = neuron_idx % grid_size;
+                    let x = grid_x + (col as f64) * cell_size + cell_size / 2.0;
+                    let y = grid_y + (row as f64) * cell_size + cell_size / 2.0;
+                    positions.push(NeuronPosition {
+                        layer_idx,
+                        neuron_idx,
+                        x,
+                        y,
+                    });
+                }
+            } else if layer_idx == 1 && actual_size > 20 {
+                // Hidden layer: column of small dots
+                let layer_x = INPUT_PANEL_WIDTH + 100.0 + (layer_idx as f64) * LAYER_SPACING;
+                let dot_size = 4.0;
+                let dot_spacing = 1.0;
+                let total_height = actual_size as f64 * (dot_size + dot_spacing);
+                let start_y = (canvas_height - total_height) / 2.0;
+
+                for neuron_idx in 0..actual_size {
+                    let y = start_y + (neuron_idx as f64) * (dot_size + dot_spacing) + dot_size / 2.0;
+                    positions.push(NeuronPosition {
+                        layer_idx,
+                        neuron_idx,
+                        x: layer_x,
+                        y,
+                    });
+                }
             } else {
-                0.0
-            };
+                // Output layer: column layout (only 10 neurons)
+                let layer_x = INPUT_PANEL_WIDTH + 100.0 + (layer_idx as f64) * LAYER_SPACING;
 
-            let total_height = (display_size - 1) as f64 * layer_spacing;
-            let start_y = (canvas_height - total_height) / 2.0;
+                // Calculate spacing to fit all neurons with room
+                let neuron_spacing = (NEURON_RADIUS * 2.5).min(available_height / actual_size as f64);
+                let total_height = (actual_size - 1) as f64 * neuron_spacing;
+                let start_y = (canvas_height - total_height) / 2.0;
 
-            for neuron_idx in 0..display_size {
-                let y = start_y + (neuron_idx as f64) * layer_spacing;
-                positions.push(NeuronPosition {
-                    layer_idx,
-                    neuron_idx,
-                    x: layer_x,
-                    y,
-                });
+                for neuron_idx in 0..actual_size {
+                    let y = start_y + (neuron_idx as f64) * neuron_spacing;
+                    positions.push(NeuronPosition {
+                        layer_idx,
+                        neuron_idx,
+                        x: layer_x,
+                        y,
+                    });
+                }
             }
         }
 
@@ -184,6 +218,21 @@ impl State {
             .iter()
             .find(|p| p.layer_idx == layer_idx && p.neuron_idx == neuron_idx)
             .map(|p| (p.x, p.y))
+    }
+
+    /// Returns the hovered input neuron index (0-783) from either digit canvas or main canvas
+    fn get_hovered_input(&self) -> Option<usize> {
+        // Digit canvas hover takes priority
+        if let Some(idx) = self.hovered_digit_pixel {
+            return Some(idx);
+        }
+        // Check if hovering input layer on main canvas
+        if let Some((layer_idx, neuron_idx)) = self.hovered_neuron {
+            if layer_idx == 0 {
+                return Some(neuron_idx);
+            }
+        }
+        None
     }
 
     fn zoom_at(&mut self, screen_x: f64, screen_y: f64, delta: f64) {
@@ -768,6 +817,55 @@ fn setup_handlers(document: &Document) -> Result<(), JsValue> {
         .set_onclick(Some(scale_closure.as_ref().unchecked_ref()));
     scale_closure.forget();
 
+    // Digit canvas mouse handlers (for weight visualization on hover)
+    let digit_canvas = document
+        .get_element_by_id("digit-canvas")
+        .ok_or("no digit canvas")?
+        .dyn_into::<HtmlCanvasElement>()?;
+
+    // Digit canvas mouse move - track which pixel is being hovered
+    let doc_clone = document.clone();
+    let digit_mousemove_closure = Closure::wrap(Box::new(move |event: MouseEvent| {
+        let x = event.offset_x() as f64;
+        let y = event.offset_y() as f64;
+
+        // Convert canvas coords (140x140) to pixel index (28x28)
+        // Each pixel is displayed at 5x scale
+        let col = (x / 5.0).floor() as usize;
+        let row = (y / 5.0).floor() as usize;
+
+        if col < 28 && row < 28 {
+            let pixel_idx = row * 28 + col;
+            STATE.with(|state| {
+                if let Some(ref mut s) = *state.borrow_mut() {
+                    s.hovered_digit_pixel = Some(pixel_idx);
+                }
+            });
+            let _ = render_digit(&doc_clone);
+            let _ = render(&doc_clone);
+            let _ = update_weight_tooltip(&doc_clone, event.client_x() as f64, event.client_y() as f64);
+        }
+    }) as Box<dyn Fn(MouseEvent)>);
+    digit_canvas.add_event_listener_with_callback("mousemove", digit_mousemove_closure.as_ref().unchecked_ref())?;
+    digit_mousemove_closure.forget();
+
+    // Digit canvas mouse leave - clear hover
+    let doc_clone = document.clone();
+    let digit_mouseleave_closure = Closure::wrap(Box::new(move |_event: MouseEvent| {
+        STATE.with(|state| {
+            if let Some(ref mut s) = *state.borrow_mut() {
+                s.hovered_digit_pixel = None;
+            }
+        });
+        if let Some(tooltip) = doc_clone.get_element_by_id("tooltip") {
+            let _ = tooltip.dyn_into::<HtmlElement>().unwrap().style().set_property("display", "none");
+        }
+        let _ = render_digit(&doc_clone);
+        let _ = render(&doc_clone);
+    }) as Box<dyn Fn(MouseEvent)>);
+    digit_canvas.add_event_listener_with_callback("mouseleave", digit_mouseleave_closure.as_ref().unchecked_ref())?;
+    digit_mouseleave_closure.forget();
+
     Ok(())
 }
 
@@ -1014,6 +1112,34 @@ fn update_tooltip(document: &Document, mouse_x: f64, mouse_y: f64) -> Result<(),
                     ));
                 }
 
+                // Input layer: show weight stats
+                if layer_idx == 0 {
+                    let layer = &s.network.layers[0];
+                    let mut min_w = f32::INFINITY;
+                    let mut max_w = f32::NEG_INFINITY;
+                    let mut sum_w = 0.0f32;
+                    for j in 0..layer.output_size {
+                        let w = layer.get_weight(neuron_idx, j);
+                        min_w = min_w.min(w);
+                        max_w = max_w.max(w);
+                        sum_w += w;
+                    }
+                    let avg_w = sum_w / layer.output_size as f32;
+
+                    html.push_str(&format!(
+                        "<div style='margin-top: 8px; padding-top: 8px; border-top: 1px solid #2a3a4a;'>\
+                         <div style='color: {}; font-size: 11px; margin-bottom: 4px;'>WEIGHTS TO HIDDEN</div>\
+                         <div>Min: <span style='color: {};'>{:.4}</span></div>\
+                         <div>Max: <span style='color: {};'>{:.4}</span></div>\
+                         <div>Avg: <b>{:.4}</b></div>\
+                         </div>",
+                        TEXT_DIM,
+                        ACCENT_SECONDARY, min_w,
+                        ACCENT_COLOR, max_w,
+                        avg_w
+                    ));
+                }
+
                 // Output layer: show class name
                 if layer_idx == num_layers - 1 {
                     html.push_str(&format!(
@@ -1028,6 +1154,77 @@ fn update_tooltip(document: &Document, mouse_x: f64, mouse_y: f64) -> Result<(),
                 tooltip.style().set_property("top", &format!("{}px", mouse_y + 15.0)).unwrap();
             } else {
                 tooltip.style().set_property("display", "none").unwrap();
+            }
+        }
+    });
+
+    Ok(())
+}
+
+/// Update tooltip for weight visualization when hovering digit canvas
+fn update_weight_tooltip(document: &Document, mouse_x: f64, mouse_y: f64) -> Result<(), JsValue> {
+    let tooltip = document
+        .get_element_by_id("tooltip")
+        .ok_or("no tooltip")?
+        .dyn_into::<HtmlElement>()?;
+
+    STATE.with(|state| {
+        let state = state.borrow();
+        if let Some(ref s) = *state {
+            if let Some(pixel_idx) = s.hovered_digit_pixel {
+                let row = pixel_idx / 28;
+                let col = pixel_idx % 28;
+
+                // Get pixel value
+                let pixel_val = s.current_digit_idx
+                    .and_then(|idx| s.digits.get(idx))
+                    .map(|d| d.pixels()[pixel_idx])
+                    .unwrap_or(0);
+
+                // Get weight stats from this input neuron to hidden layer
+                let layer = &s.network.layers[0];
+                let mut min_w = f32::INFINITY;
+                let mut max_w = f32::NEG_INFINITY;
+                let mut sum_w = 0.0f32;
+                let mut sum_abs_w = 0.0f32;
+
+                for j in 0..layer.output_size {
+                    let w = layer.get_weight(pixel_idx, j);
+                    min_w = min_w.min(w);
+                    max_w = max_w.max(w);
+                    sum_w += w;
+                    sum_abs_w += w.abs();
+                }
+                let avg_w = sum_w / layer.output_size as f32;
+                let avg_abs_w = sum_abs_w / layer.output_size as f32;
+
+                let html = format!(
+                    "<div style='margin-bottom: 8px; font-weight: 600; color: {};'>Input Pixel</div>\
+                     <div style='margin-bottom: 4px;'>Position: <b>({}, {})</b></div>\
+                     <div style='margin-bottom: 4px;'>Index: <b>#{}</b></div>\
+                     <div style='margin-bottom: 8px;'>Value: <b>{}</b> ({:.1}%)</div>\
+                     <div style='padding-top: 8px; border-top: 1px solid #2a3a4a;'>\
+                     <div style='color: {}; font-size: 11px; margin-bottom: 4px;'>WEIGHTS TO HIDDEN ({} connections)</div>\
+                     <div>Min: <span style='color: {};'>{:.4}</span></div>\
+                     <div>Max: <span style='color: {};'>{:.4}</span></div>\
+                     <div>Avg: <b>{:.4}</b></div>\
+                     <div>Avg |w|: <b>{:.4}</b></div>\
+                     </div>",
+                    NEURON_HOVER,
+                    col, row,
+                    pixel_idx,
+                    pixel_val, pixel_val as f32 / 255.0 * 100.0,
+                    TEXT_DIM, layer.output_size,
+                    ACCENT_SECONDARY, min_w,
+                    ACCENT_COLOR, max_w,
+                    avg_w,
+                    avg_abs_w
+                );
+
+                tooltip.set_inner_html(&html);
+                tooltip.style().set_property("display", "block").unwrap();
+                tooltip.style().set_property("left", &format!("{}px", mouse_x + 15.0)).unwrap();
+                tooltip.style().set_property("top", &format!("{}px", mouse_y + 15.0)).unwrap();
             }
         }
     });
@@ -1060,8 +1257,11 @@ fn render_digit(document: &Document) -> Result<(), JsValue> {
                 let pixels = digit.pixels();
                 for row in 0..28 {
                     for col in 0..28 {
-                        let pixel = pixels[row * 28 + col];
-                        if pixel > 10 {
+                        let pixel_idx = row * 28 + col;
+                        let pixel = pixels[pixel_idx];
+                        let is_hovered = s.hovered_digit_pixel == Some(pixel_idx);
+
+                        if pixel > 10 || is_hovered {
                             // Color based on intensity
                             let intensity = pixel as f64 / 255.0;
                             let r = (78.0 * (1.0 - intensity) + 78.0 * intensity) as u8;
@@ -1069,6 +1269,13 @@ fn render_digit(document: &Document) -> Result<(), JsValue> {
                             let b = (196.0 * (1.0 - intensity) + 196.0 * intensity) as u8;
                             ctx.set_fill_style_str(&format!("rgb({},{},{})", r, g, b));
                             ctx.fill_rect(col as f64 * 5.0, row as f64 * 5.0, 5.0, 5.0);
+                        }
+
+                        // Draw highlight border for hovered pixel
+                        if is_hovered {
+                            ctx.set_stroke_style_str(ACCENT_COLOR);
+                            ctx.set_line_width(2.0);
+                            ctx.stroke_rect(col as f64 * 5.0, row as f64 * 5.0, 5.0, 5.0);
                         }
                     }
                 }
@@ -1133,15 +1340,63 @@ fn render(document: &Document) -> Result<(), JsValue> {
 
         // Draw weights (connections)
         let hovered = state.hovered_neuron;
-        let display_sizes: Vec<usize> = layer_sizes.iter().map(|&s| s.min(50)).collect();
+        let hovered_input = state.get_hovered_input();
 
-        // Only draw a subset of weights for performance
         ctx.set_line_width(0.5 / state.zoom);
         ctx.set_global_alpha(0.15);
 
-        for layer_idx in 0..state.network.num_layers() {
-            let from_size = display_sizes[layer_idx].min(20);
-            let to_size = display_sizes[layer_idx + 1].min(20);
+        // Draw input->hidden weights when an input neuron is hovered
+        if let Some(input_idx) = hovered_input {
+            let layer = &state.network.layers[0];
+            let hidden_size = layer_sizes[1]; // Show all hidden neurons
+
+            // Find weight magnitude range for color scaling
+            let mut max_abs_weight = 0.0f32;
+            for j in 0..layer.output_size {
+                let w = layer.get_weight(input_idx, j).abs();
+                if w > max_abs_weight {
+                    max_abs_weight = w;
+                }
+            }
+
+            // Get input neuron position
+            if let Some((x1, y1)) = state.get_position(0, input_idx) {
+                for to_idx in 0..hidden_size {
+                    if let Some((x2, y2)) = state.get_position(1, to_idx) {
+                        let weight = layer.get_weight(input_idx, to_idx);
+                        let normalized = if max_abs_weight > 0.0 {
+                            weight.abs() / max_abs_weight
+                        } else {
+                            0.0
+                        };
+
+                        // Color: positive weights = teal, negative weights = red
+                        if weight >= 0.0 {
+                            ctx.set_stroke_style_str(ACCENT_COLOR);
+                        } else {
+                            ctx.set_stroke_style_str(ACCENT_SECONDARY);
+                        }
+
+                        // Alpha and line width based on magnitude
+                        let alpha = 0.3 + normalized as f64 * 0.6;
+                        let line_width = (0.5 + normalized as f64 * 2.5) / state.zoom;
+
+                        ctx.set_global_alpha(alpha);
+                        ctx.set_line_width(line_width);
+
+                        ctx.begin_path();
+                        ctx.move_to(x1, y1);
+                        ctx.line_to(x2, y2);
+                        ctx.stroke();
+                    }
+                }
+            }
+        }
+
+        // Draw hidden->output weights
+        for layer_idx in 1..state.network.num_layers() {
+            let from_size = layer_sizes[layer_idx]; // Show all neurons
+            let to_size = layer_sizes[layer_idx + 1];
 
             for from_idx in 0..from_size {
                 for to_idx in 0..to_size {
@@ -1175,8 +1430,16 @@ fn render(document: &Document) -> Result<(), JsValue> {
         ctx.set_global_alpha(1.0);
 
         // Draw neurons
+        let input_cell_size = 4.0;
+        let hidden_cell_size = 4.0;
+
         for pos in &state.neuron_positions {
             let is_hovered = hovered.map_or(false, |(l, n)| l == pos.layer_idx && n == pos.neuron_idx);
+            let is_input_layer = pos.layer_idx == 0;
+            let is_hidden_layer = pos.layer_idx == 1 && layer_sizes[1] > 20;
+            let is_output_layer = pos.layer_idx == num_layers - 1;
+            // Check if this input neuron is hovered (either from main canvas or digit canvas)
+            let is_input_hovered = pos.layer_idx == 0 && hovered_input == Some(pos.neuron_idx);
 
             // Get activation value for this neuron
             let activation = state.current_activations
@@ -1185,26 +1448,8 @@ fn render(document: &Document) -> Result<(), JsValue> {
                 .copied()
                 .unwrap_or(0.0);
 
-            // Draw glow for active neurons
-            if activation > 0.1 {
-                let glow_alpha = (activation * 0.4).min(0.4) as f64;
-                let glow_radius = NEURON_RADIUS * (1.5 + activation as f64 * 0.5);
-
-                ctx.begin_path();
-                let _ = ctx.arc(pos.x, pos.y, glow_radius, 0.0, std::f64::consts::TAU);
-                ctx.set_fill_style_str(ACCENT_COLOR);
-                ctx.set_global_alpha(glow_alpha);
-                ctx.fill();
-                ctx.set_global_alpha(1.0);
-            }
-
-            // Neuron circle
-            ctx.begin_path();
-            let _ = ctx.arc(pos.x, pos.y, NEURON_RADIUS, 0.0, std::f64::consts::TAU);
-
             // Color based on activation
             let fill_color = if activation > 0.01 {
-                // Interpolate between base and active color
                 let t = activation.min(1.0) as f64;
                 let r = (26.0 * (1.0 - t) + 78.0 * t) as u8;
                 let g = (42.0 * (1.0 - t) + 205.0 * t) as u8;
@@ -1214,21 +1459,82 @@ fn render(document: &Document) -> Result<(), JsValue> {
                 NEURON_BASE.to_string()
             };
 
-            if is_hovered {
-                ctx.set_fill_style_str(NEURON_HOVER);
-                ctx.set_stroke_style_str("#ffffff");
-                ctx.set_line_width(2.5 / state.zoom);
-            } else {
+            if is_input_layer {
+                // Input layer: draw as small square (pixel)
                 ctx.set_fill_style_str(&fill_color);
-                ctx.set_stroke_style_str(NEURON_STROKE);
-                ctx.set_line_width(1.5 / state.zoom);
-            }
+                ctx.fill_rect(
+                    pos.x - input_cell_size / 2.0,
+                    pos.y - input_cell_size / 2.0,
+                    input_cell_size,
+                    input_cell_size,
+                );
 
-            ctx.fill();
-            ctx.stroke();
+                // Highlight hovered input pixel
+                if is_input_hovered {
+                    ctx.set_stroke_style_str(ACCENT_COLOR);
+                    ctx.set_line_width(2.0 / state.zoom);
+                    ctx.stroke_rect(
+                        pos.x - input_cell_size / 2.0 - 1.0,
+                        pos.y - input_cell_size / 2.0 - 1.0,
+                        input_cell_size + 2.0,
+                        input_cell_size + 2.0,
+                    );
+                }
+            } else if is_hidden_layer {
+                // Hidden layer: draw as small squares in column
+                ctx.set_fill_style_str(&fill_color);
+                ctx.fill_rect(
+                    pos.x - hidden_cell_size / 2.0,
+                    pos.y - hidden_cell_size / 2.0,
+                    hidden_cell_size,
+                    hidden_cell_size,
+                );
 
-            // Draw output layer labels
-            if pos.layer_idx == num_layers - 1 {
+                // Highlight if hovered
+                if is_hovered {
+                    ctx.set_stroke_style_str(ACCENT_COLOR);
+                    ctx.set_line_width(2.0 / state.zoom);
+                    ctx.stroke_rect(
+                        pos.x - hidden_cell_size / 2.0 - 2.0,
+                        pos.y - hidden_cell_size / 2.0 - 2.0,
+                        hidden_cell_size + 4.0,
+                        hidden_cell_size + 4.0,
+                    );
+                }
+            } else if is_output_layer {
+                // Output layer: draw as circles with labels
+
+                // Draw glow for active neurons
+                if activation > 0.1 {
+                    let glow_alpha = (activation * 0.4).min(0.4) as f64;
+                    let glow_radius = NEURON_RADIUS * (1.5 + activation as f64 * 0.5);
+
+                    ctx.begin_path();
+                    let _ = ctx.arc(pos.x, pos.y, glow_radius, 0.0, std::f64::consts::TAU);
+                    ctx.set_fill_style_str(ACCENT_COLOR);
+                    ctx.set_global_alpha(glow_alpha);
+                    ctx.fill();
+                    ctx.set_global_alpha(1.0);
+                }
+
+                // Neuron circle
+                ctx.begin_path();
+                let _ = ctx.arc(pos.x, pos.y, NEURON_RADIUS, 0.0, std::f64::consts::TAU);
+
+                if is_hovered {
+                    ctx.set_fill_style_str(NEURON_HOVER);
+                    ctx.set_stroke_style_str("#ffffff");
+                    ctx.set_line_width(2.5 / state.zoom);
+                } else {
+                    ctx.set_fill_style_str(&fill_color);
+                    ctx.set_stroke_style_str(NEURON_STROKE);
+                    ctx.set_line_width(1.5 / state.zoom);
+                }
+
+                ctx.fill();
+                ctx.stroke();
+
+                // Draw output layer labels
                 ctx.set_fill_style_str(TEXT_COLOR);
                 ctx.set_font(&format!("{}px 'Inter', sans-serif", (10.0 / state.zoom.sqrt()).max(8.0)));
                 ctx.set_text_align("center");
