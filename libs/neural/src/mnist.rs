@@ -1,7 +1,6 @@
-use crate::{DataLoader, Sample};
 use common::Digit;
 
-/// Wrapper around Digit that implements the Data trait
+/// Wrapper around Digit for MNIST samples
 #[derive(Clone)]
 pub struct MnistSample {
     digit: Digit,
@@ -20,13 +19,16 @@ impl MnistSample {
         self.digit.pixels()
     }
 
-    /// Returns normalized pixel values (0.0 - 1.0)
+    /// Returns normalized pixel values (0.0 - 1.0) as f64
     pub fn normalized_pixels(&self) -> Vec<f64> {
         self.digit.pixels().iter().map(|&p| p as f64 / 255.0).collect()
     }
-}
 
-impl Sample for MnistSample {}
+    /// Returns normalized pixel values as f32 (for network input)
+    pub fn normalized_pixels_f32(&self) -> Vec<f32> {
+        self.digit.pixels().iter().map(|&p| p as f32 / 255.0).collect()
+    }
+}
 
 /// Loads MNIST data and provides iteration over batches
 pub struct MnistLoader {
@@ -67,6 +69,11 @@ impl MnistLoader {
         self.samples.is_empty()
     }
 
+    /// Get reference to all samples
+    pub fn samples(&self) -> &[MnistSample] {
+        &self.samples
+    }
+
     /// Reset to beginning
     pub fn reset(&mut self) {
         self.current_index = 0;
@@ -100,14 +107,6 @@ impl Iterator for MnistLoader {
         } else {
             Some(batch)
         }
-    }
-}
-
-impl DataLoader for MnistLoader {
-    type SampleType = MnistSample;
-
-    fn reset(&mut self) {
-        self.current_index = 0;
     }
 }
 

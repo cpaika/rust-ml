@@ -1,23 +1,29 @@
 use common::{parse_digits_from_bytes, Digit};
-use neural::NeuralNet;
-use std::rc::Rc;
+use neural::{Network, mnist::MnistSample};
 use wasm_bindgen::prelude::*;
 use web_sys::{CanvasRenderingContext2d, Document, HtmlCanvasElement, HtmlElement, MouseEvent, WheelEvent};
 
-const INPUT_PANEL_WIDTH: f64 = 150.0;
-const NEURON_RADIUS: f64 = 10.0;
+const INPUT_PANEL_WIDTH: f64 = 200.0;
+const NEURON_RADIUS: f64 = 12.0;
 const LAYER_SPACING: f64 = 300.0;
 
-// Softer color palette
-const BG_COLOR: &str = "#0f0f1a";
-const PANEL_BG: &str = "#1a1a2e";
-const NEURON_FILL: &str = "#2d4a6e";
-const NEURON_STROKE: &str = "#5a9fd4";
-const NEURON_HOVER: &str = "#7ec8e3";
-const WEIGHT_COLOR: &str = "#3a4a5c";
-const WEIGHT_HIGHLIGHT: &str = "#7ec8e3";
-const ACCENT_COLOR: &str = "#5a9fd4";
-const TEXT_COLOR: &str = "#c8d6e5";
+// Modern color palette
+const BG_COLOR: &str = "#0a0a0f";
+const PANEL_BG: &str = "#12121a";
+const NEURON_BASE: &str = "#1a2a4a";
+const NEURON_STROKE: &str = "#3d5a80";
+const NEURON_HOVER: &str = "#98c1d9";
+const WEIGHT_COLOR: &str = "#2a3a4a";
+const WEIGHT_HIGHLIGHT: &str = "#4ecdc4";
+const ACCENT_COLOR: &str = "#4ecdc4";
+const ACCENT_SECONDARY: &str = "#ff6b6b";
+const TEXT_COLOR: &str = "#e0e6ed";
+const TEXT_DIM: &str = "#6b7280";
+
+// Training parameters
+const LEARNING_RATE: f32 = 0.1;
+const BATCH_SIZE: usize = 32;
+const BATCHES_PER_FRAME: usize = 5;
 
 struct NeuronPosition {
     layer_idx: usize,
@@ -26,32 +32,75 @@ struct NeuronPosition {
     y: f64,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum TrainingState {
+    Idle,
+    Training,
+    Paused,
+}
+
+struct TrainingMetrics {
+    epoch: usize,
+    batch: usize,
+    total_batches: usize,
+    samples_seen: usize,
+    loss: f32,
+    accuracy: f32,
+    loss_history: Vec<f32>,
+    log_scale: bool,
+}
+
+impl Default for TrainingMetrics {
+    fn default() -> Self {
+        Self {
+            epoch: 0,
+            batch: 0,
+            total_batches: 0,
+            samples_seen: 0,
+            loss: 0.0,
+            accuracy: 0.0,
+            loss_history: Vec::new(),
+            log_scale: false,
+        }
+    }
+}
+
 struct State {
-    network: NeuralNet,
+    network: Network,
     digits: Vec<Digit>,
+    samples: Vec<MnistSample>,
     current_digit_idx: Option<usize>,
     neuron_positions: Vec<NeuronPosition>,
-    hovered_neuron: Option<(usize, usize)>, // (layer_idx, neuron_idx)
+    hovered_neuron: Option<(usize, usize)>,
     mouse_x: f64,
     mouse_y: f64,
-    // Canvas dimensions
     canvas_width: f64,
     canvas_height: f64,
-    // Pan and zoom
     offset_x: f64,
     offset_y: f64,
     zoom: f64,
     is_dragging: bool,
     drag_start_x: f64,
     drag_start_y: f64,
+    // Training state
+    training_state: TrainingState,
+    metrics: TrainingMetrics,
+    current_batch_idx: usize,
+    // Current activations for visualization
+    current_activations: Vec<Vec<f32>>,
+    current_prediction: Option<usize>,
 }
 
 impl State {
-    fn new(network: NeuralNet, digits: Vec<Digit>, canvas_width: f64, canvas_height: f64) -> Self {
+    fn new(network: Network, digits: Vec<Digit>, canvas_width: f64, canvas_height: f64) -> Self {
         let neuron_positions = Self::calculate_positions(&network, canvas_width, canvas_height);
+        let samples: Vec<MnistSample> = digits.iter().map(|d| MnistSample::new(d.clone())).collect();
+        let num_layers = network.layer_sizes().len();
+
         Self {
             network,
             digits,
+            samples,
             current_digit_idx: None,
             neuron_positions,
             hovered_neuron: None,
@@ -65,33 +114,39 @@ impl State {
             is_dragging: false,
             drag_start_x: 0.0,
             drag_start_y: 0.0,
+            training_state: TrainingState::Idle,
+            metrics: TrainingMetrics::default(),
+            current_batch_idx: 0,
+            current_activations: vec![Vec::new(); num_layers],
+            current_prediction: None,
         }
     }
 
-    fn calculate_positions(network: &NeuralNet, canvas_width: f64, canvas_height: f64) -> Vec<NeuronPosition> {
+    fn calculate_positions(network: &Network, _canvas_width: f64, canvas_height: f64) -> Vec<NeuronPosition> {
         let mut positions = Vec::new();
+        let layer_sizes = network.layer_sizes();
 
-        // Collect all layers: input, hidden layers, output
-        let all_layers = Self::get_all_layers(network);
-        let num_layers = all_layers.len();
+        // Cap display at 50 per layer for performance
+        let display_sizes: Vec<usize> = layer_sizes.iter().map(|&s| s.min(50)).collect();
 
-        // Find max neurons in any layer for scaling
-        let max_neurons = all_layers.iter().map(|l| l.neurons.len()).max().unwrap_or(1);
+        let available_height = canvas_height - 100.0;
 
-        // Calculate spacing to fit all neurons with padding
-        let available_height = canvas_height - 100.0; // padding top and bottom
-        let neuron_spacing = (available_height / max_neurons as f64).min(NEURON_RADIUS * 3.0);
-
-        for (layer_idx, layer) in all_layers.iter().enumerate() {
-            let num_neurons = layer.neurons.len();
+        for (layer_idx, &display_size) in display_sizes.iter().enumerate() {
             let layer_x = INPUT_PANEL_WIDTH + 100.0 + (layer_idx as f64) * LAYER_SPACING;
 
-            // Center neurons vertically
-            let total_height = (num_neurons - 1) as f64 * neuron_spacing;
+            // Calculate spacing for THIS layer - smaller layers get more spacing
+            // Min spacing of 3x radius, max based on available height
+            let layer_spacing = if display_size > 1 {
+                (available_height / (display_size - 1) as f64).min(NEURON_RADIUS * 4.0)
+            } else {
+                0.0
+            };
+
+            let total_height = (display_size - 1) as f64 * layer_spacing;
             let start_y = (canvas_height - total_height) / 2.0;
 
-            for neuron_idx in 0..num_neurons {
-                let y = start_y + (neuron_idx as f64) * neuron_spacing;
+            for neuron_idx in 0..display_size {
+                let y = start_y + (neuron_idx as f64) * layer_spacing;
                 positions.push(NeuronPosition {
                     layer_idx,
                     neuron_idx,
@@ -104,13 +159,6 @@ impl State {
         positions
     }
 
-    fn get_all_layers(network: &NeuralNet) -> Vec<&neural::Layer> {
-        let mut layers = vec![&network.input_layer];
-        layers.extend(network.hidden_layers.iter());
-        layers.push(&network.output_layer);
-        layers
-    }
-
     fn screen_to_world(&self, screen_x: f64, screen_y: f64) -> (f64, f64) {
         let world_x = (screen_x - self.offset_x) / self.zoom;
         let world_y = (screen_y - self.offset_y) / self.zoom;
@@ -119,7 +167,7 @@ impl State {
 
     fn get_neuron_at(&self, screen_x: f64, screen_y: f64) -> Option<(usize, usize)> {
         let (world_x, world_y) = self.screen_to_world(screen_x, screen_y);
-        let hit_radius = NEURON_RADIUS / self.zoom.sqrt(); // Adjust hit area with zoom
+        let hit_radius = NEURON_RADIUS / self.zoom.sqrt();
 
         for pos in &self.neuron_positions {
             let dx = world_x - pos.x;
@@ -140,14 +188,9 @@ impl State {
 
     fn zoom_at(&mut self, screen_x: f64, screen_y: f64, delta: f64) {
         let zoom_factor = if delta > 0.0 { 0.9 } else { 1.1 };
-        let new_zoom = (self.zoom * zoom_factor).clamp(0.3, 3.0);
-
-        // Zoom toward mouse position
+        let new_zoom = (self.zoom * zoom_factor).clamp(0.2, 4.0);
         let (world_x, world_y) = self.screen_to_world(screen_x, screen_y);
-
         self.zoom = new_zoom;
-
-        // Adjust offset to keep world point under mouse
         self.offset_x = screen_x - world_x * self.zoom;
         self.offset_y = screen_y - world_y * self.zoom;
     }
@@ -169,12 +212,110 @@ impl State {
         self.is_dragging = false;
     }
 
-    fn load_next_digit(&mut self) {
-        let next_idx = match self.current_digit_idx {
-            Some(idx) => (idx + 1) % self.digits.len(),
-            None => 0,
-        };
+    fn load_random_digit(&mut self) {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let next_idx = rng.gen_range(0..self.digits.len());
         self.current_digit_idx = Some(next_idx);
+
+        // Run forward pass using the DIGIT (not shuffled samples array)
+        // This ensures the displayed digit matches what we're predicting
+        let digit = &self.digits[next_idx];
+        let input: Vec<f32> = digit.pixels().iter().map(|&p| p as f32 / 255.0).collect();
+        let output = self.network.forward(&input);
+
+        // Store activations for each layer
+        self.current_activations = vec![input.clone()]; // Input layer
+        for i in 0..self.network.num_layers() {
+            if let Some(acts) = self.network.get_activations(i) {
+                self.current_activations.push(acts.clone());
+            }
+        }
+
+        // Find prediction
+        self.current_prediction = output
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(idx, _)| idx);
+    }
+
+    fn reset_network(&mut self) {
+        self.network = Network::mnist_default();
+        self.training_state = TrainingState::Idle;
+        self.metrics = TrainingMetrics::default();
+        self.current_batch_idx = 0;
+        self.current_activations.clear();
+        self.current_prediction = None;
+    }
+
+    fn train_batches(&mut self, num_batches: usize) {
+        let total_samples = self.samples.len();
+        let num_total_batches = total_samples / BATCH_SIZE;
+
+        for _ in 0..num_batches {
+            if self.training_state != TrainingState::Training {
+                break;
+            }
+
+            // Get batch
+            let start = self.current_batch_idx * BATCH_SIZE;
+            let end = (start + BATCH_SIZE).min(total_samples);
+
+            if start >= total_samples {
+                // End of epoch
+                self.metrics.epoch += 1;
+                self.current_batch_idx = 0;
+
+                // Stop training if accuracy is good enough or max epochs reached
+                if self.metrics.accuracy >= 0.99 || self.metrics.epoch >= 10 {
+                    self.training_state = TrainingState::Paused;
+                    break;
+                }
+
+                // Shuffle samples for next epoch (simple shuffle)
+                use rand::seq::SliceRandom;
+                let mut rng = rand::thread_rng();
+                self.samples.shuffle(&mut rng);
+                continue;
+            }
+
+            let inputs: Vec<Vec<f32>> = self.samples[start..end]
+                .iter()
+                .map(|s| s.normalized_pixels_f32())
+                .collect();
+            let labels: Vec<u8> = self.samples[start..end].iter().map(|s| s.label()).collect();
+
+            // Train batch
+            let loss = self.network.train_batch(&inputs, &labels, LEARNING_RATE);
+
+            // Update metrics
+            self.metrics.batch = self.current_batch_idx;
+            self.metrics.total_batches = num_total_batches;
+            self.metrics.samples_seen += inputs.len();
+            self.metrics.loss = loss;
+            self.metrics.loss_history.push(loss);
+
+            // Evaluate accuracy periodically (every 10 batches)
+            // Use digits array (not shuffled) from the END as validation set
+            // This gives us a true measure of generalization
+            if self.current_batch_idx % 10 == 0 {
+                let val_size = 500;
+                let val_start = self.digits.len().saturating_sub(val_size);
+                let eval_inputs: Vec<Vec<f32>> = self.digits[val_start..]
+                    .iter()
+                    .map(|d| d.pixels().iter().map(|&p| p as f32 / 255.0).collect())
+                    .collect();
+                let eval_labels: Vec<u8> = self.digits[val_start..]
+                    .iter()
+                    .map(|d| d.label())
+                    .collect();
+                let (_, acc) = self.network.evaluate(&eval_inputs, &eval_labels);
+                self.metrics.accuracy = acc;
+            }
+
+            self.current_batch_idx += 1;
+        }
     }
 }
 
@@ -183,10 +324,8 @@ thread_local! {
 }
 
 pub fn init(csv_data: &[u8]) -> Result<(), JsValue> {
-    let digits =
-        parse_digits_from_bytes(csv_data).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let network = NeuralNet::new(784, 3, 28, 10);
+    let digits = parse_digits_from_bytes(csv_data).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let network = Network::mnist_default();
 
     let window = web_sys::window().ok_or("no window")?;
     let document = window.document().ok_or("no document")?;
@@ -201,10 +340,10 @@ pub fn init(csv_data: &[u8]) -> Result<(), JsValue> {
     setup_ui(&document, canvas_width as u32, canvas_height as u32)?;
     setup_handlers(&document)?;
 
-    // Load first digit by default
+    // Load first digit
     STATE.with(|state| {
         if let Some(ref mut s) = *state.borrow_mut() {
-            s.load_next_digit();
+            s.load_random_digit();
         }
     });
     render_digit(&document)?;
@@ -217,80 +356,189 @@ fn setup_ui(document: &Document, canvas_width: u32, canvas_height: u32) -> Resul
     let body = document.body().ok_or("no body")?;
     body.set_attribute(
         "style",
-        &format!("margin: 0; overflow: hidden; background: {}; font-family: 'Segoe UI', sans-serif;", BG_COLOR),
+        &format!("margin: 0; overflow: hidden; background: {}; font-family: 'Inter', 'Segoe UI', sans-serif;", BG_COLOR),
     )?;
 
     // Container
     let container = document.create_element("div")?;
     container.set_attribute("style", "display: flex; height: 100vh;")?;
 
-    // Left panel with button and digit display
+    // Left panel
     let left_panel = document.create_element("div")?;
     left_panel.set_id("left-panel");
     left_panel.set_attribute(
         "style",
         &format!(
-            "width: {}px; background: {}; padding: 20px; box-sizing: border-box;",
+            "width: {}px; background: {}; padding: 20px; box-sizing: border-box; \
+             display: flex; flex-direction: column; gap: 16px; border-right: 1px solid #1a1a2e;",
             INPUT_PANEL_WIDTH as u32, PANEL_BG
         ),
     )?;
 
-    // Load digit button
+    // Title
+    let title = document.create_element("div")?;
+    title.set_attribute(
+        "style",
+        &format!("color: {}; font-size: 18px; font-weight: 600; margin-bottom: 8px;", ACCENT_COLOR),
+    )?;
+    title.set_text_content(Some("MNIST Trainer"));
+    left_panel.append_child(&title)?;
+
+    // Training Controls Section
+    let controls_section = document.create_element("div")?;
+    controls_section.set_attribute("style", "display: flex; flex-direction: column; gap: 8px;")?;
+
+    // Start/Stop Button
+    let train_btn = document.create_element("button")?;
+    train_btn.set_id("train-btn");
+    train_btn.set_text_content(Some("Start Training"));
+    train_btn.set_attribute(
+        "style",
+        &format!(
+            "width: 100%; padding: 12px; font-size: 14px; cursor: pointer; \
+             background: {}; color: {}; border: none; border-radius: 8px; \
+             font-weight: 600; transition: all 0.2s;",
+            ACCENT_COLOR, BG_COLOR
+        ),
+    )?;
+    controls_section.append_child(&train_btn)?;
+
+    // Reset Button
+    let reset_btn = document.create_element("button")?;
+    reset_btn.set_id("reset-btn");
+    reset_btn.set_text_content(Some("Reset Network"));
+    reset_btn.set_attribute(
+        "style",
+        &format!(
+            "width: 100%; padding: 10px; font-size: 13px; cursor: pointer; \
+             background: transparent; color: {}; border: 1px solid {}; border-radius: 8px; \
+             transition: all 0.2s;",
+            ACCENT_SECONDARY, ACCENT_SECONDARY
+        ),
+    )?;
+    controls_section.append_child(&reset_btn)?;
+
+    left_panel.append_child(&controls_section)?;
+
+    // Metrics Section
+    let metrics_section = document.create_element("div")?;
+    metrics_section.set_id("metrics-section");
+    metrics_section.set_attribute(
+        "style",
+        &format!(
+            "background: {}; border-radius: 8px; padding: 12px; \
+             border: 1px solid #1a1a2e;",
+            BG_COLOR
+        ),
+    )?;
+    metrics_section.set_inner_html(&format!(
+        "<div style='color: {}; font-size: 12px; margin-bottom: 8px; font-weight: 600;'>TRAINING METRICS</div>\
+         <div id='metric-epoch' style='color: {}; font-size: 13px; margin-bottom: 4px;'>Epoch: 0</div>\
+         <div id='metric-batch' style='color: {}; font-size: 13px; margin-bottom: 4px;'>Batch: 0/0</div>\
+         <div id='metric-loss' style='color: {}; font-size: 13px; margin-bottom: 4px;'>Loss: -</div>\
+         <div id='metric-accuracy' style='color: {}; font-size: 13px;'>Accuracy: -</div>",
+        TEXT_DIM, TEXT_COLOR, TEXT_COLOR, TEXT_COLOR, TEXT_COLOR
+    ));
+    left_panel.append_child(&metrics_section)?;
+
+    // Loss Chart
+    let chart_canvas = document.create_element("canvas")?.dyn_into::<HtmlCanvasElement>()?;
+    chart_canvas.set_id("loss-chart");
+    chart_canvas.set_width(160);
+    chart_canvas.set_height(80);
+    chart_canvas.set_attribute(
+        "style",
+        &format!("background: {}; border-radius: 8px; border: 1px solid #1a1a2e;", BG_COLOR),
+    )?;
+    left_panel.append_child(&chart_canvas)?;
+
+    // Scale toggle button
+    let scale_btn = document.create_element("button")?;
+    scale_btn.set_id("scale-btn");
+    scale_btn.set_text_content(Some("Linear Scale"));
+    scale_btn.set_attribute(
+        "style",
+        &format!(
+            "width: 100%; padding: 8px; font-size: 12px; cursor: pointer; \
+             background: #1a2a3a; color: {}; border: 1px solid {}; border-radius: 6px; \
+             margin-top: 6px; font-weight: 500; transition: all 0.2s;",
+            TEXT_COLOR, NEURON_STROKE
+        ),
+    )?;
+    left_panel.append_child(&scale_btn)?;
+
+    // Divider
+    let divider = document.create_element("div")?;
+    divider.set_attribute("style", "height: 1px; background: #1a1a2e; margin: 8px 0;")?;
+    left_panel.append_child(&divider)?;
+
+    // Sample Section
+    let sample_label = document.create_element("div")?;
+    sample_label.set_attribute(
+        "style",
+        &format!("color: {}; font-size: 12px; font-weight: 600;", TEXT_DIM),
+    )?;
+    sample_label.set_text_content(Some("CURRENT SAMPLE"));
+    left_panel.append_child(&sample_label)?;
+
+    // Random Image Button
     let load_btn = document.create_element("button")?;
     load_btn.set_id("load-btn");
     load_btn.set_text_content(Some("Random Image"));
     load_btn.set_attribute(
         "style",
         &format!(
-            "width: 100%; padding: 10px; font-size: 14px; cursor: pointer; \
-             background: {}; color: white; border: none; border-radius: 5px; \
-             margin-bottom: 20px; transition: background 0.2s;",
-            ACCENT_COLOR
+            "width: 100%; padding: 10px; font-size: 13px; cursor: pointer; \
+             background: transparent; color: {}; border: 1px solid {}; border-radius: 8px; \
+             transition: all 0.2s;",
+            NEURON_STROKE, NEURON_STROKE
         ),
     )?;
     left_panel.append_child(&load_btn)?;
 
-    // Digit display canvas
-    let digit_canvas = document
-        .create_element("canvas")?
-        .dyn_into::<HtmlCanvasElement>()?;
+    // Digit display
+    let digit_canvas = document.create_element("canvas")?.dyn_into::<HtmlCanvasElement>()?;
     digit_canvas.set_id("digit-canvas");
-    digit_canvas.set_width(112);
-    digit_canvas.set_height(112);
+    digit_canvas.set_width(140);
+    digit_canvas.set_height(140);
     digit_canvas.set_attribute(
         "style",
-        &format!("background: {}; border: 2px solid {}; border-radius: 5px;", BG_COLOR, ACCENT_COLOR),
+        &format!("background: {}; border: 2px solid {}; border-radius: 8px; align-self: center;", BG_COLOR, NEURON_STROKE),
     )?;
     left_panel.append_child(&digit_canvas)?;
 
-    // Digit label
-    let digit_label = document.create_element("div")?;
-    digit_label.set_id("digit-label");
-    digit_label.set_attribute(
+    // Prediction display
+    let prediction_div = document.create_element("div")?;
+    prediction_div.set_id("prediction-div");
+    prediction_div.set_attribute(
         "style",
-        &format!("color: {}; text-align: center; margin-top: 10px; font-size: 14px;", TEXT_COLOR),
+        &format!(
+            "color: {}; text-align: center; font-size: 14px; padding: 8px; \
+             background: {}; border-radius: 8px;",
+            TEXT_COLOR, BG_COLOR
+        ),
     )?;
-    digit_label.set_text_content(Some("No digit loaded"));
-    left_panel.append_child(&digit_label)?;
+    prediction_div.set_text_content(Some("Prediction: -"));
+    left_panel.append_child(&prediction_div)?;
+
+    // Spacer
+    let spacer = document.create_element("div")?;
+    spacer.set_attribute("style", "flex: 1;")?;
+    left_panel.append_child(&spacer)?;
 
     // Instructions
     let instructions = document.create_element("div")?;
     instructions.set_attribute(
         "style",
-        &format!(
-            "color: {}; font-size: 11px; margin-top: 30px; line-height: 1.6; opacity: 0.7;",
-            TEXT_COLOR
-        ),
+        &format!("color: {}; font-size: 11px; line-height: 1.6;", TEXT_DIM),
     )?;
-    instructions.set_inner_html("Scroll to zoom<br>Drag to pan<br>Hover for details");
+    instructions.set_inner_html("Scroll: Zoom<br>Drag: Pan<br>Hover: Details");
     left_panel.append_child(&instructions)?;
 
     container.append_child(&left_panel)?;
 
     // Main canvas
-    let canvas = document
-        .create_element("canvas")?
-        .dyn_into::<HtmlCanvasElement>()?;
+    let canvas = document.create_element("canvas")?.dyn_into::<HtmlCanvasElement>()?;
     canvas.set_id("main-canvas");
     canvas.set_width(canvas_width);
     canvas.set_height(canvas_height);
@@ -306,7 +554,7 @@ fn setup_ui(document: &Document, canvas_width: u32, canvas_height: u32) -> Resul
         "style",
         &format!(
             "position: fixed; \
-             background: rgba(26, 26, 46, 0.95); \
+             background: rgba(18, 18, 26, 0.95); \
              color: {}; \
              padding: 12px 16px; \
              border-radius: 8px; \
@@ -316,8 +564,8 @@ fn setup_ui(document: &Document, canvas_width: u32, canvas_height: u32) -> Resul
              z-index: 1000; \
              border: 1px solid {}; \
              max-width: 280px; \
-             box-shadow: 0 4px 20px rgba(0,0,0,0.3);",
-            TEXT_COLOR, ACCENT_COLOR
+             box-shadow: 0 8px 32px rgba(0,0,0,0.4);",
+            TEXT_COLOR, NEURON_STROKE
         ),
     )?;
     body.append_child(&tooltip)?;
@@ -346,33 +594,27 @@ fn setup_handlers(document: &Document) -> Result<(), JsValue> {
         });
         let _ = render(&doc_clone);
     }) as Box<dyn Fn(WheelEvent)>);
-
     canvas.add_event_listener_with_callback("wheel", wheel_closure.as_ref().unchecked_ref())?;
     wheel_closure.forget();
 
-    // Mouse down for drag start
+    // Mouse down
     let doc_clone = document.clone();
     let canvas_clone = canvas.clone();
     let mousedown_closure = Closure::wrap(Box::new(move |event: MouseEvent| {
         let x = event.offset_x() as f64;
         let y = event.offset_y() as f64;
-
         STATE.with(|state| {
             if let Some(ref mut s) = *state.borrow_mut() {
                 s.start_drag(x, y);
             }
         });
-        canvas_clone
-            .style()
-            .set_property("cursor", "grabbing")
-            .unwrap();
+        canvas_clone.style().set_property("cursor", "grabbing").unwrap();
         let _ = render(&doc_clone);
     }) as Box<dyn Fn(MouseEvent)>);
-
     canvas.add_event_listener_with_callback("mousedown", mousedown_closure.as_ref().unchecked_ref())?;
     mousedown_closure.forget();
 
-    // Mouse move for drag and hover
+    // Mouse move
     let doc_clone = document.clone();
     let mousemove_closure = Closure::wrap(Box::new(move |event: MouseEvent| {
         let x = event.offset_x() as f64;
@@ -382,15 +624,12 @@ fn setup_handlers(document: &Document) -> Result<(), JsValue> {
             if let Some(ref mut s) = *state.borrow_mut() {
                 s.mouse_x = x;
                 s.mouse_y = y;
-
                 let was_dragging = s.is_dragging;
                 s.drag(x, y);
-
                 let old_hover = s.hovered_neuron;
                 if !s.is_dragging {
                     s.hovered_neuron = s.get_neuron_at(x, y);
                 }
-
                 was_dragging || old_hover != s.hovered_neuron
             } else {
                 false
@@ -398,19 +637,14 @@ fn setup_handlers(document: &Document) -> Result<(), JsValue> {
         });
 
         let _ = update_tooltip(&doc_clone, event.client_x() as f64, event.client_y() as f64);
-
         if needs_render {
             let _ = render(&doc_clone);
         }
     }) as Box<dyn Fn(MouseEvent)>);
-
-    canvas.add_event_listener_with_callback(
-        "mousemove",
-        mousemove_closure.as_ref().unchecked_ref(),
-    )?;
+    canvas.add_event_listener_with_callback("mousemove", mousemove_closure.as_ref().unchecked_ref())?;
     mousemove_closure.forget();
 
-    // Mouse up for drag end
+    // Mouse up
     let doc_clone = document.clone();
     let canvas_clone = canvas.clone();
     let mouseup_closure = Closure::wrap(Box::new(move |_event: MouseEvent| {
@@ -419,13 +653,9 @@ fn setup_handlers(document: &Document) -> Result<(), JsValue> {
                 s.end_drag();
             }
         });
-        canvas_clone
-            .style()
-            .set_property("cursor", "grab")
-            .unwrap();
+        canvas_clone.style().set_property("cursor", "grab").unwrap();
         let _ = render(&doc_clone);
     }) as Box<dyn Fn(MouseEvent)>);
-
     canvas.add_event_listener_with_callback("mouseup", mouseup_closure.as_ref().unchecked_ref())?;
     mouseup_closure.forget();
 
@@ -439,47 +669,297 @@ fn setup_handlers(document: &Document) -> Result<(), JsValue> {
                 s.hovered_neuron = None;
             }
         });
-        canvas_clone
-            .style()
-            .set_property("cursor", "grab")
-            .unwrap();
-
+        canvas_clone.style().set_property("cursor", "grab").unwrap();
         if let Some(tooltip) = doc_clone.get_element_by_id("tooltip") {
-            let _ = tooltip
-                .dyn_into::<HtmlElement>()
-                .unwrap()
-                .style()
-                .set_property("display", "none");
+            let _ = tooltip.dyn_into::<HtmlElement>().unwrap().style().set_property("display", "none");
         }
-
         let _ = render(&doc_clone);
     }) as Box<dyn Fn(MouseEvent)>);
-
-    canvas.add_event_listener_with_callback(
-        "mouseleave",
-        mouseleave_closure.as_ref().unchecked_ref(),
-    )?;
+    canvas.add_event_listener_with_callback("mouseleave", mouseleave_closure.as_ref().unchecked_ref())?;
     mouseleave_closure.forget();
 
-    // Load button click
+    // Load button
     let doc_clone = document.clone();
     let load_closure = Closure::wrap(Box::new(move |_event: MouseEvent| {
         STATE.with(|state| {
             if let Some(ref mut s) = *state.borrow_mut() {
-                s.load_next_digit();
+                s.load_random_digit();
             }
         });
-
         let _ = render_digit(&doc_clone);
         let _ = render(&doc_clone);
+        let _ = update_prediction(&doc_clone);
     }) as Box<dyn Fn(MouseEvent)>);
-
     document
         .get_element_by_id("load-btn")
         .ok_or("no load button")?
         .dyn_into::<HtmlElement>()?
         .set_onclick(Some(load_closure.as_ref().unchecked_ref()));
     load_closure.forget();
+
+    // Train button
+    let doc_clone = document.clone();
+    let train_closure = Closure::wrap(Box::new(move |_event: MouseEvent| {
+        let should_start = STATE.with(|state| {
+            if let Some(ref mut s) = *state.borrow_mut() {
+                match s.training_state {
+                    TrainingState::Idle | TrainingState::Paused => {
+                        s.training_state = TrainingState::Training;
+                        true
+                    }
+                    TrainingState::Training => {
+                        s.training_state = TrainingState::Paused;
+                        false
+                    }
+                }
+            } else {
+                false
+            }
+        });
+
+        let _ = update_train_button(&doc_clone);
+
+        if should_start {
+            start_training_loop(doc_clone.clone());
+        }
+    }) as Box<dyn Fn(MouseEvent)>);
+    document
+        .get_element_by_id("train-btn")
+        .ok_or("no train button")?
+        .dyn_into::<HtmlElement>()?
+        .set_onclick(Some(train_closure.as_ref().unchecked_ref()));
+    train_closure.forget();
+
+    // Reset button
+    let doc_clone = document.clone();
+    let reset_closure = Closure::wrap(Box::new(move |_event: MouseEvent| {
+        STATE.with(|state| {
+            if let Some(ref mut s) = *state.borrow_mut() {
+                s.reset_network();
+            }
+        });
+        let _ = update_train_button(&doc_clone);
+        let _ = update_metrics(&doc_clone);
+        let _ = render_loss_chart(&doc_clone);
+        let _ = render(&doc_clone);
+    }) as Box<dyn Fn(MouseEvent)>);
+    document
+        .get_element_by_id("reset-btn")
+        .ok_or("no reset button")?
+        .dyn_into::<HtmlElement>()?
+        .set_onclick(Some(reset_closure.as_ref().unchecked_ref()));
+    reset_closure.forget();
+
+    // Scale toggle button
+    let doc_clone = document.clone();
+    let scale_closure = Closure::wrap(Box::new(move |_event: MouseEvent| {
+        STATE.with(|state| {
+            if let Some(ref mut s) = *state.borrow_mut() {
+                s.metrics.log_scale = !s.metrics.log_scale;
+            }
+        });
+        let _ = update_scale_button(&doc_clone);
+        let _ = render_loss_chart(&doc_clone);
+    }) as Box<dyn Fn(MouseEvent)>);
+    document
+        .get_element_by_id("scale-btn")
+        .ok_or("no scale button")?
+        .dyn_into::<HtmlElement>()?
+        .set_onclick(Some(scale_closure.as_ref().unchecked_ref()));
+    scale_closure.forget();
+
+    Ok(())
+}
+
+fn start_training_loop(document: Document) {
+    let window = web_sys::window().unwrap();
+
+    let closure = Closure::wrap(Box::new(move || {
+        let is_training = STATE.with(|state| {
+            if let Some(ref mut s) = *state.borrow_mut() {
+                if s.training_state == TrainingState::Training {
+                    s.train_batches(BATCHES_PER_FRAME);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        });
+
+        if is_training {
+            let _ = update_metrics(&document);
+            let _ = render_loss_chart(&document);
+            let _ = render(&document);
+
+            // Schedule next frame
+            start_training_loop(document.clone());
+        }
+    }) as Box<dyn Fn()>);
+
+    let _ = window.request_animation_frame(closure.as_ref().unchecked_ref());
+    closure.forget();
+}
+
+fn update_train_button(document: &Document) -> Result<(), JsValue> {
+    let btn = document.get_element_by_id("train-btn").ok_or("no train button")?;
+
+    STATE.with(|state| {
+        let state = state.borrow();
+        if let Some(ref s) = *state {
+            let (text, bg_color) = match s.training_state {
+                TrainingState::Idle => ("Start Training", ACCENT_COLOR),
+                TrainingState::Training => ("Pause Training", ACCENT_SECONDARY),
+                TrainingState::Paused => ("Resume Training", ACCENT_COLOR),
+            };
+            btn.set_text_content(Some(text));
+            let _ = btn.dyn_ref::<HtmlElement>().unwrap().style().set_property(
+                "background",
+                bg_color,
+            );
+        }
+    });
+
+    Ok(())
+}
+
+fn update_scale_button(document: &Document) -> Result<(), JsValue> {
+    let btn = document.get_element_by_id("scale-btn").ok_or("no scale button")?;
+
+    STATE.with(|state| {
+        let state = state.borrow();
+        if let Some(ref s) = *state {
+            let text = if s.metrics.log_scale { "Log Scale" } else { "Linear Scale" };
+            btn.set_text_content(Some(text));
+        }
+    });
+
+    Ok(())
+}
+
+fn update_metrics(document: &Document) -> Result<(), JsValue> {
+    STATE.with(|state| {
+        let state = state.borrow();
+        if let Some(ref s) = *state {
+            if let Some(el) = document.get_element_by_id("metric-epoch") {
+                el.set_text_content(Some(&format!("Epoch: {}", s.metrics.epoch + 1)));
+            }
+            if let Some(el) = document.get_element_by_id("metric-batch") {
+                el.set_text_content(Some(&format!(
+                    "Batch: {}/{}",
+                    s.metrics.batch + 1,
+                    s.metrics.total_batches
+                )));
+            }
+            if let Some(el) = document.get_element_by_id("metric-loss") {
+                el.set_text_content(Some(&format!("Loss: {:.4}", s.metrics.loss)));
+            }
+            if let Some(el) = document.get_element_by_id("metric-accuracy") {
+                el.set_text_content(Some(&format!("Accuracy: {:.1}%", s.metrics.accuracy * 100.0)));
+            }
+        }
+    });
+
+    Ok(())
+}
+
+fn render_loss_chart(document: &Document) -> Result<(), JsValue> {
+    let canvas = document
+        .get_element_by_id("loss-chart")
+        .ok_or("no loss chart")?
+        .dyn_into::<HtmlCanvasElement>()?;
+
+    let ctx = canvas
+        .get_context("2d")?
+        .ok_or("no 2d context")?
+        .dyn_into::<CanvasRenderingContext2d>()?;
+
+    let width = canvas.width() as f64;
+    let height = canvas.height() as f64;
+
+    // Clear
+    ctx.set_fill_style_str(BG_COLOR);
+    ctx.fill_rect(0.0, 0.0, width, height);
+
+    STATE.with(|state| {
+        let state = state.borrow();
+        if let Some(ref s) = *state {
+            let history = &s.metrics.loss_history;
+            if history.len() < 2 {
+                return;
+            }
+
+            let log_scale = s.metrics.log_scale;
+
+            // Transform values if log scale
+            let values: Vec<f64> = if log_scale {
+                history.iter().map(|&v| (v.max(1e-7) as f64).ln()).collect()
+            } else {
+                history.iter().map(|&v| v as f64).collect()
+            };
+
+            // Find min/max for scaling (always show full history)
+            let max_val = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let min_val = values.iter().cloned().fold(f64::INFINITY, f64::min);
+            let range = (max_val - min_val).max(0.1);
+
+            // Draw line
+            ctx.set_stroke_style_str(ACCENT_COLOR);
+            ctx.set_line_width(1.5);
+            ctx.begin_path();
+
+            let padding = 10.0;
+            let chart_width = width - 2.0 * padding;
+            let chart_height = height - 2.0 * padding;
+
+            for (i, &val) in values.iter().enumerate() {
+                let x = padding + (i as f64 / (values.len() - 1) as f64) * chart_width;
+                let y = padding + (1.0 - (val - min_val) / range) * chart_height;
+
+                if i == 0 {
+                    ctx.move_to(x, y);
+                } else {
+                    ctx.line_to(x, y);
+                }
+            }
+            ctx.stroke();
+
+            // Draw axis labels
+            ctx.set_fill_style_str(TEXT_DIM);
+            ctx.set_font("9px sans-serif");
+            ctx.set_text_align("left");
+
+            let max_display = if log_scale { max_val.exp() } else { max_val };
+            let min_display = if log_scale { min_val.exp() } else { min_val };
+
+            let _ = ctx.fill_text(&format!("{:.2}", max_display), 2.0, 10.0);
+            let _ = ctx.fill_text(&format!("{:.2}", min_display), 2.0, height - 2.0);
+        }
+    });
+
+    Ok(())
+}
+
+fn update_prediction(document: &Document) -> Result<(), JsValue> {
+    let pred_div = document.get_element_by_id("prediction-div").ok_or("no prediction div")?;
+
+    STATE.with(|state| {
+        let state = state.borrow();
+        if let Some(ref s) = *state {
+            if let (Some(digit_idx), Some(pred)) = (s.current_digit_idx, s.current_prediction) {
+                let actual = s.digits[digit_idx].label();
+                let correct = pred as u8 == actual;
+                let color = if correct { ACCENT_COLOR } else { ACCENT_SECONDARY };
+
+                pred_div.set_inner_html(&format!(
+                    "<div>Predicted: <span style='color: {}; font-weight: 600;'>{}</span></div>\
+                     <div style='font-size: 12px; color: {};'>Actual: {}</div>",
+                    color, pred, TEXT_DIM, actual
+                ));
+            }
+        }
+    });
 
     Ok(())
 }
@@ -494,23 +974,9 @@ fn update_tooltip(document: &Document, mouse_x: f64, mouse_y: f64) -> Result<(),
         let state = state.borrow();
         if let Some(ref s) = *state {
             if let Some((layer_idx, neuron_idx)) = s.hovered_neuron {
-                let all_layers = State::get_all_layers(&s.network);
-                let neuron = &all_layers[layer_idx].neurons[neuron_idx];
+                let layer_sizes = s.network.layer_sizes();
+                let num_layers = layer_sizes.len();
 
-                // Count weights connected to this neuron
-                let mut incoming_weights = Vec::new();
-                let mut outgoing_weights = Vec::new();
-
-                for weight in s.network.weights() {
-                    if Rc::ptr_eq(weight.destination(), neuron) {
-                        incoming_weights.push(weight.weight());
-                    }
-                    if Rc::ptr_eq(weight.source(), neuron) {
-                        outgoing_weights.push(weight.weight());
-                    }
-                }
-
-                let num_layers = all_layers.len();
                 let layer_name = if layer_idx == 0 {
                     "Input Layer"
                 } else if layer_idx == num_layers - 1 {
@@ -519,45 +985,47 @@ fn update_tooltip(document: &Document, mouse_x: f64, mouse_y: f64) -> Result<(),
                     "Hidden Layer"
                 };
 
+                let bias = s.network.get_bias(layer_idx, neuron_idx);
+
+                // Get activation if available
+                let activation = s.current_activations
+                    .get(layer_idx)
+                    .and_then(|a| a.get(neuron_idx))
+                    .copied();
+
                 let mut html = format!(
                     "<div style='margin-bottom: 8px; font-weight: 600; color: {};'>{}</div>\
-                     <div style='margin-bottom: 4px;'>Neuron <b>#{}</b></div>\
-                     <div style='margin-bottom: 4px;'>Bias: <b>{}</b></div>",
-                    NEURON_HOVER, layer_name, neuron_idx, neuron.bias()
+                     <div style='margin-bottom: 4px;'>Neuron <b>#{}</b> of {}</div>",
+                    NEURON_HOVER, layer_name, neuron_idx, layer_sizes[layer_idx]
                 );
 
-                if !incoming_weights.is_empty() {
+                if layer_idx > 0 {
                     html.push_str(&format!(
-                        "<div style='margin-top: 8px; padding-top: 8px; border-top: 1px solid #3a4a5c;'>\
-                         <b>Incoming:</b> {} weights<br>\
-                         Range: [{:.3}, {:.3}]</div>",
-                        incoming_weights.len(),
-                        incoming_weights.iter().cloned().fold(f64::INFINITY, f64::min),
-                        incoming_weights.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+                        "<div style='margin-bottom: 4px;'>Bias: <b>{:.4}</b></div>",
+                        bias
                     ));
                 }
 
-                if !outgoing_weights.is_empty() {
+                if let Some(act) = activation {
                     html.push_str(&format!(
-                        "<div style='margin-top: 8px; padding-top: 8px; border-top: 1px solid #3a4a5c;'>\
-                         <b>Outgoing:</b> {} weights<br>\
-                         Range: [{:.3}, {:.3}]</div>",
-                        outgoing_weights.len(),
-                        outgoing_weights.iter().cloned().fold(f64::INFINITY, f64::min),
-                        outgoing_weights.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+                        "<div style='margin-top: 8px; padding-top: 8px; border-top: 1px solid #2a3a4a;'>\
+                         Activation: <b style='color: {};'>{:.4}</b></div>",
+                        ACCENT_COLOR, act
+                    ));
+                }
+
+                // Output layer: show class name
+                if layer_idx == num_layers - 1 {
+                    html.push_str(&format!(
+                        "<div style='margin-top: 4px; color: {};'>Class: Digit {}</div>",
+                        TEXT_DIM, neuron_idx
                     ));
                 }
 
                 tooltip.set_inner_html(&html);
                 tooltip.style().set_property("display", "block").unwrap();
-                tooltip
-                    .style()
-                    .set_property("left", &format!("{}px", mouse_x + 15.0))
-                    .unwrap();
-                tooltip
-                    .style()
-                    .set_property("top", &format!("{}px", mouse_y + 15.0))
-                    .unwrap();
+                tooltip.style().set_property("left", &format!("{}px", mouse_x + 15.0)).unwrap();
+                tooltip.style().set_property("top", &format!("{}px", mouse_y + 15.0)).unwrap();
             } else {
                 tooltip.style().set_property("display", "none").unwrap();
             }
@@ -578,10 +1046,6 @@ fn render_digit(document: &Document) -> Result<(), JsValue> {
         .ok_or("no 2d context")?
         .dyn_into::<CanvasRenderingContext2d>()?;
 
-    let label_div = document
-        .get_element_by_id("digit-label")
-        .ok_or("no label div")?;
-
     STATE.with(|state| {
         let state = state.borrow();
         if let Some(ref s) = *state {
@@ -590,31 +1054,29 @@ fn render_digit(document: &Document) -> Result<(), JsValue> {
 
                 // Clear
                 ctx.set_fill_style_str(BG_COLOR);
-                ctx.fill_rect(0.0, 0.0, 112.0, 112.0);
+                ctx.fill_rect(0.0, 0.0, 140.0, 140.0);
 
-                // Draw digit scaled 4x
+                // Draw digit scaled 5x
                 let pixels = digit.pixels();
                 for row in 0..28 {
                     for col in 0..28 {
                         let pixel = pixels[row * 28 + col];
                         if pixel > 10 {
-                            let gray = pixel;
-                            ctx.set_fill_style_str(&format!("rgb({},{},{})", gray, gray, gray));
-                            ctx.fill_rect(col as f64 * 4.0, row as f64 * 4.0, 4.0, 4.0);
+                            // Color based on intensity
+                            let intensity = pixel as f64 / 255.0;
+                            let r = (78.0 * (1.0 - intensity) + 78.0 * intensity) as u8;
+                            let g = (205.0 * (1.0 - intensity) + 205.0 * intensity) as u8;
+                            let b = (196.0 * (1.0 - intensity) + 196.0 * intensity) as u8;
+                            ctx.set_fill_style_str(&format!("rgb({},{},{})", r, g, b));
+                            ctx.fill_rect(col as f64 * 5.0, row as f64 * 5.0, 5.0, 5.0);
                         }
                     }
                 }
-
-                label_div.set_text_content(Some(&format!(
-                    "Label: {} (#{}/{})",
-                    digit.label(),
-                    digit_idx + 1,
-                    s.digits.len()
-                )));
             }
         }
     });
 
+    let _ = update_prediction(document);
     Ok(())
 }
 
@@ -643,65 +1105,70 @@ fn render(document: &Document) -> Result<(), JsValue> {
         ctx.scale(state.zoom, state.zoom)?;
 
         // Draw layer labels
+        let layer_sizes = state.network.layer_sizes();
+        let num_layers = layer_sizes.len();
+
         ctx.set_fill_style_str(TEXT_COLOR);
-        ctx.set_font("16px 'Segoe UI', sans-serif");
-        let all_layers = State::get_all_layers(&state.network);
-        let num_layers = all_layers.len();
-        for i in 0..num_layers {
+        ctx.set_font("bold 16px 'Inter', sans-serif");
+        ctx.set_text_align("center");
+
+        for (i, &size) in layer_sizes.iter().enumerate() {
             let label = if i == 0 {
-                "Input Layer"
+                format!("Input\n({})", size)
             } else if i == num_layers - 1 {
-                "Output Layer"
+                format!("Output\n({})", size)
             } else {
-                "Hidden Layer"
+                format!("Hidden\n({})", size)
             };
+
             if let Some((x, _)) = state.get_position(i, 0) {
-                ctx.set_text_align("center");
-                let _ = ctx.fill_text(label, x, 30.0);
+                ctx.set_fill_style_str(TEXT_DIM);
+                let _ = ctx.fill_text(&label.split('\n').next().unwrap_or(""), x, 25.0);
+                ctx.set_fill_style_str(TEXT_DIM);
+                ctx.set_font("12px 'Inter', sans-serif");
+                let _ = ctx.fill_text(&format!("({})", size), x, 45.0);
+                ctx.set_font("bold 16px 'Inter', sans-serif");
             }
         }
 
-        // Draw weights first (behind neurons)
+        // Draw weights (connections)
         let hovered = state.hovered_neuron;
+        let display_sizes: Vec<usize> = layer_sizes.iter().map(|&s| s.min(50)).collect();
 
-        for weight in state.network.weights() {
-            // Find source and dest positions by matching Rc pointers
-            let mut source_pos = None;
-            let mut dest_pos = None;
+        // Only draw a subset of weights for performance
+        ctx.set_line_width(0.5 / state.zoom);
+        ctx.set_global_alpha(0.15);
 
-            for (layer_idx, layer) in all_layers.iter().enumerate() {
-                for (neuron_idx, neuron) in layer.neurons.iter().enumerate() {
-                    if Rc::ptr_eq(neuron, weight.source()) {
-                        source_pos = state.get_position(layer_idx, neuron_idx);
-                    }
-                    if Rc::ptr_eq(neuron, weight.destination()) {
-                        dest_pos = state.get_position(layer_idx, neuron_idx);
+        for layer_idx in 0..state.network.num_layers() {
+            let from_size = display_sizes[layer_idx].min(20);
+            let to_size = display_sizes[layer_idx + 1].min(20);
+
+            for from_idx in 0..from_size {
+                for to_idx in 0..to_size {
+                    if let (Some((x1, y1)), Some((x2, y2))) = (
+                        state.get_position(layer_idx, from_idx),
+                        state.get_position(layer_idx + 1, to_idx),
+                    ) {
+                        let is_connected = hovered.map_or(false, |(l, n)| {
+                            (l == layer_idx && n == from_idx) || (l == layer_idx + 1 && n == to_idx)
+                        });
+
+                        if is_connected {
+                            ctx.set_stroke_style_str(WEIGHT_HIGHLIGHT);
+                            ctx.set_global_alpha(0.8);
+                            ctx.set_line_width(2.0 / state.zoom);
+                        } else {
+                            ctx.set_stroke_style_str(WEIGHT_COLOR);
+                            ctx.set_global_alpha(0.15);
+                            ctx.set_line_width(0.5 / state.zoom);
+                        }
+
+                        ctx.begin_path();
+                        ctx.move_to(x1, y1);
+                        ctx.line_to(x2, y2);
+                        ctx.stroke();
                     }
                 }
-            }
-
-            if let (Some((x1, y1)), Some((x2, y2))) = (source_pos, dest_pos) {
-                // Check if this weight connects to hovered neuron
-                let is_connected = hovered.map_or(false, |(layer_idx, neuron_idx)| {
-                    let hovered_neuron = &all_layers[layer_idx].neurons[neuron_idx];
-                    Rc::ptr_eq(weight.source(), hovered_neuron)
-                        || Rc::ptr_eq(weight.destination(), hovered_neuron)
-                });
-
-                if is_connected {
-                    ctx.set_stroke_style_str(WEIGHT_HIGHLIGHT);
-                    ctx.set_line_width(2.0 / state.zoom);
-                    ctx.set_global_alpha(0.9);
-                } else {
-                    ctx.set_stroke_style_str(WEIGHT_COLOR);
-                    ctx.set_line_width(0.5 / state.zoom);
-                    ctx.set_global_alpha(0.2);
-                }
-
-                ctx.begin_path();
-                ctx.move_to(x1, y1);
-                ctx.line_to(x2, y2);
-                ctx.stroke();
             }
         }
 
@@ -709,25 +1176,65 @@ fn render(document: &Document) -> Result<(), JsValue> {
 
         // Draw neurons
         for pos in &state.neuron_positions {
-            let is_hovered =
-                hovered.map_or(false, |(l, n)| l == pos.layer_idx && n == pos.neuron_idx);
+            let is_hovered = hovered.map_or(false, |(l, n)| l == pos.layer_idx && n == pos.neuron_idx);
+
+            // Get activation value for this neuron
+            let activation = state.current_activations
+                .get(pos.layer_idx)
+                .and_then(|a| a.get(pos.neuron_idx))
+                .copied()
+                .unwrap_or(0.0);
+
+            // Draw glow for active neurons
+            if activation > 0.1 {
+                let glow_alpha = (activation * 0.4).min(0.4) as f64;
+                let glow_radius = NEURON_RADIUS * (1.5 + activation as f64 * 0.5);
+
+                ctx.begin_path();
+                let _ = ctx.arc(pos.x, pos.y, glow_radius, 0.0, std::f64::consts::TAU);
+                ctx.set_fill_style_str(ACCENT_COLOR);
+                ctx.set_global_alpha(glow_alpha);
+                ctx.fill();
+                ctx.set_global_alpha(1.0);
+            }
 
             // Neuron circle
             ctx.begin_path();
             let _ = ctx.arc(pos.x, pos.y, NEURON_RADIUS, 0.0, std::f64::consts::TAU);
 
+            // Color based on activation
+            let fill_color = if activation > 0.01 {
+                // Interpolate between base and active color
+                let t = activation.min(1.0) as f64;
+                let r = (26.0 * (1.0 - t) + 78.0 * t) as u8;
+                let g = (42.0 * (1.0 - t) + 205.0 * t) as u8;
+                let b = (74.0 * (1.0 - t) + 196.0 * t) as u8;
+                format!("rgb({},{},{})", r, g, b)
+            } else {
+                NEURON_BASE.to_string()
+            };
+
             if is_hovered {
                 ctx.set_fill_style_str(NEURON_HOVER);
                 ctx.set_stroke_style_str("#ffffff");
-                ctx.set_line_width(2.0 / state.zoom);
+                ctx.set_line_width(2.5 / state.zoom);
             } else {
-                ctx.set_fill_style_str(NEURON_FILL);
+                ctx.set_fill_style_str(&fill_color);
                 ctx.set_stroke_style_str(NEURON_STROKE);
                 ctx.set_line_width(1.5 / state.zoom);
             }
 
             ctx.fill();
             ctx.stroke();
+
+            // Draw output layer labels
+            if pos.layer_idx == num_layers - 1 {
+                ctx.set_fill_style_str(TEXT_COLOR);
+                ctx.set_font(&format!("{}px 'Inter', sans-serif", (10.0 / state.zoom.sqrt()).max(8.0)));
+                ctx.set_text_align("center");
+                ctx.set_text_baseline("middle");
+                let _ = ctx.fill_text(&pos.neuron_idx.to_string(), pos.x, pos.y);
+            }
         }
 
         ctx.restore();
