@@ -11,10 +11,13 @@ pub mod mnist;
 pub mod gpu;
 
 #[cfg(any(feature = "gpu", test))]
+pub mod gpu_buffers;
+
+#[cfg(any(feature = "gpu", test))]
 mod gpu_network;
 
 #[cfg(any(feature = "gpu", test))]
-pub use gpu_network::GpuNetwork;
+pub use gpu_network::{GpuNetwork, WeightSyncState};
 
 use rand::Rng;
 

@@ -11,43 +11,17 @@ use wgpu;
 #[cfg(feature = "gpu")]
 use bytemuck::{Pod, Zeroable};
 
-/// Helper to wait for buffer mapping in a cross-platform way
-/// Takes the staging buffer and returns the mapped data as Vec<f32>
-#[cfg(feature = "gpu")]
+/// Helper to wait for buffer mapping - blocking version for native
+#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 fn read_buffer_sync(device: &wgpu::Device, staging_buffer: &wgpu::Buffer, _size: u64) -> Vec<f32> {
     let buffer_slice = staging_buffer.slice(..);
 
-    #[cfg(target_arch = "wasm32")]
-    {
-        // In WASM, use a Cell since we're single-threaded
-        use std::cell::Cell;
-        use std::rc::Rc;
-
-        let mapped = Rc::new(Cell::new(false));
-        let mapped_clone = mapped.clone();
-
-        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            result.expect("Buffer mapping failed");
-            mapped_clone.set(true);
-        });
-
-        // Poll until the buffer is mapped
-        // In WebGPU, the callback is invoked during poll when work completes
-        while !mapped.get() {
-            device.poll(wgpu::Maintain::Poll);
-        }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        // On native, use channel-based blocking
-        let (sender, receiver) = std::sync::mpsc::channel();
-        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            sender.send(result).unwrap();
-        });
-        device.poll(wgpu::Maintain::Wait);
-        receiver.recv().unwrap().unwrap();
-    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+        sender.send(result).unwrap();
+    });
+    device.poll(wgpu::Maintain::Wait);
+    receiver.recv().unwrap().unwrap();
 
     let data = buffer_slice.get_mapped_range();
     let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
@@ -56,38 +30,94 @@ fn read_buffer_sync(device: &wgpu::Device, staging_buffer: &wgpu::Buffer, _size:
     result
 }
 
-/// Helper to read buffer back into a mutable slice in a cross-platform way
-#[cfg(feature = "gpu")]
-fn read_buffer_into_sync(device: &wgpu::Device, staging_buffer: &wgpu::Buffer, dest: &mut [f32]) {
+/// Helper to wait for buffer mapping - WASM version using polling with callback check
+#[cfg(all(feature = "gpu", target_arch = "wasm32"))]
+fn read_buffer_sync(device: &wgpu::Device, staging_buffer: &wgpu::Buffer, _size: u64) -> Vec<f32> {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     let buffer_slice = staging_buffer.slice(..);
 
-    #[cfg(target_arch = "wasm32")]
-    {
-        use std::cell::Cell;
-        use std::rc::Rc;
+    // Use RefCell to track when callback fires
+    let status: Rc<RefCell<Option<Result<(), wgpu::BufferAsyncError>>>> = Rc::new(RefCell::new(None));
+    let status_clone = status.clone();
 
-        let mapped = Rc::new(Cell::new(false));
-        let mapped_clone = mapped.clone();
+    buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+        *status_clone.borrow_mut() = Some(result);
+    });
 
-        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            result.expect("Buffer mapping failed");
-            mapped_clone.set(true);
-        });
+    // In WebGPU, poll with Wait should block until the buffer is mapped
+    // This uses the browser's internal async handling
+    device.poll(wgpu::Maintain::Wait);
 
-        while !mapped.get() {
+    // Check if the callback fired
+    if status.borrow().is_none() {
+        // If callback hasn't fired yet, the GPU work might still be in progress
+        // Poll a few more times (shouldn't be needed with Maintain::Wait)
+        for _ in 0..100 {
             device.poll(wgpu::Maintain::Poll);
+            if status.borrow().is_some() {
+                break;
+            }
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let (sender, receiver) = std::sync::mpsc::channel();
-        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            sender.send(result).unwrap();
-        });
-        device.poll(wgpu::Maintain::Wait);
-        receiver.recv().unwrap().unwrap();
+    // At this point, the buffer should be mapped
+    status.borrow().as_ref().expect("Buffer mapping callback never fired").as_ref().expect("Buffer mapping failed");
+
+    let data = buffer_slice.get_mapped_range();
+    let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+    drop(data);
+    staging_buffer.unmap();
+    result
+}
+
+/// Helper to read buffer into slice - native version
+#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+fn read_buffer_into_sync(device: &wgpu::Device, staging_buffer: &wgpu::Buffer, dest: &mut [f32]) {
+    let buffer_slice = staging_buffer.slice(..);
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+        sender.send(result).unwrap();
+    });
+    device.poll(wgpu::Maintain::Wait);
+    receiver.recv().unwrap().unwrap();
+
+    let mapped_data = buffer_slice.get_mapped_range();
+    let result: &[f32] = bytemuck::cast_slice(&mapped_data);
+    dest.copy_from_slice(result);
+    drop(mapped_data);
+    staging_buffer.unmap();
+}
+
+/// Helper to read buffer into slice - WASM version
+#[cfg(all(feature = "gpu", target_arch = "wasm32"))]
+fn read_buffer_into_sync(device: &wgpu::Device, staging_buffer: &wgpu::Buffer, dest: &mut [f32]) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let buffer_slice = staging_buffer.slice(..);
+
+    let status: Rc<RefCell<Option<Result<(), wgpu::BufferAsyncError>>>> = Rc::new(RefCell::new(None));
+    let status_clone = status.clone();
+
+    buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+        *status_clone.borrow_mut() = Some(result);
+    });
+
+    device.poll(wgpu::Maintain::Wait);
+
+    if status.borrow().is_none() {
+        for _ in 0..100 {
+            device.poll(wgpu::Maintain::Poll);
+            if status.borrow().is_some() {
+                break;
+            }
+        }
     }
+
+    status.borrow().as_ref().expect("Buffer mapping callback never fired").as_ref().expect("Buffer mapping failed");
 
     let mapped_data = buffer_slice.get_mapped_range();
     let result: &[f32] = bytemuck::cast_slice(&mapped_data);
@@ -118,6 +148,14 @@ pub struct GpuContext {
     hadamard_pipeline: wgpu::ComputePipeline,
     #[cfg(feature = "gpu")]
     saxpy_pipeline: wgpu::ComputePipeline,  // y = alpha * x + y (for SGD updates)
+    #[cfg(feature = "gpu")]
+    softmax_pipeline: wgpu::ComputePipeline,  // softmax activation for output layer
+    #[cfg(feature = "gpu")]
+    output_delta_pipeline: wgpu::ComputePipeline,  // delta = softmax_output - one_hot(label)
+    #[cfg(feature = "gpu")]
+    zero_buffer_pipeline: wgpu::ComputePipeline,  // set buffer to zero
+    #[cfg(feature = "gpu")]
+    scale_buffer_pipeline: wgpu::ComputePipeline,  // multiply buffer by scalar
 }
 
 /// Matrix dimensions for compute shaders
@@ -150,6 +188,28 @@ pub struct SaxpyParams {
     pub size: u32,
     pub _pad1: u32,
     pub alpha: f32,
+    pub _pad2: u32,
+}
+
+/// Output delta params (for computing softmax - one_hot(label))
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+#[cfg_attr(feature = "gpu", derive(Pod, Zeroable))]
+pub struct OutputDeltaParams {
+    pub size: u32,
+    pub label: u32,  // The correct class label (0-indexed)
+    pub _pad1: u32,
+    pub _pad2: u32,
+}
+
+/// Scale buffer params (for multiplying buffer by scalar)
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+#[cfg_attr(feature = "gpu", derive(Pod, Zeroable))]
+pub struct ScaleParams {
+    pub size: u32,
+    pub _pad1: u32,
+    pub scale: f32,
     pub _pad2: u32,
 }
 
@@ -196,6 +256,10 @@ impl GpuContext {
         let add_bias_pipeline = Self::create_add_bias_pipeline(&device);
         let hadamard_pipeline = Self::create_hadamard_pipeline(&device);
         let saxpy_pipeline = Self::create_saxpy_pipeline(&device);
+        let softmax_pipeline = Self::create_softmax_pipeline(&device);
+        let output_delta_pipeline = Self::create_output_delta_pipeline(&device);
+        let zero_buffer_pipeline = Self::create_zero_buffer_pipeline(&device);
+        let scale_buffer_pipeline = Self::create_scale_buffer_pipeline(&device);
 
         Ok(Self {
             device,
@@ -208,6 +272,10 @@ impl GpuContext {
             add_bias_pipeline,
             hadamard_pipeline,
             saxpy_pipeline,
+            softmax_pipeline,
+            output_delta_pipeline,
+            zero_buffer_pipeline,
+            scale_buffer_pipeline,
         })
     }
 
@@ -703,6 +771,212 @@ impl GpuContext {
 
         device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("SAXPY Pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    }
+
+    fn create_softmax_pipeline(device: &wgpu::Device) -> wgpu::ComputePipeline {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Softmax Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/softmax.wgsl").into()),
+        });
+
+        // Softmax: binding 0 = params (uniform), binding 1 = data (read_write)
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Softmax Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Softmax Pipeline Layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Softmax Pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    }
+
+    fn create_output_delta_pipeline(device: &wgpu::Device) -> wgpu::ComputePipeline {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Output Delta Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/output_delta.wgsl").into()),
+        });
+
+        // output_delta: binding 0 = params, binding 1 = output (read), binding 2 = delta (read_write)
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Output Delta Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Output Delta Pipeline Layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Output Delta Pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    }
+
+    fn create_zero_buffer_pipeline(device: &wgpu::Device) -> wgpu::ComputePipeline {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Zero Buffer Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/zero_buffer.wgsl").into()),
+        });
+
+        // zero_buffer: binding 0 = params (uniform), binding 1 = data (read_write)
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Zero Buffer Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Zero Buffer Pipeline Layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Zero Buffer Pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    }
+
+    fn create_scale_buffer_pipeline(device: &wgpu::Device) -> wgpu::ComputePipeline {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Scale Buffer Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/scale_buffer.wgsl").into()),
+        });
+
+        // scale_buffer: binding 0 = params (uniform with size + scale), binding 1 = data (read_write)
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Scale Buffer Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Scale Buffer Pipeline Layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Scale Buffer Pipeline"),
             layout: Some(&pipeline_layout),
             module: &shader,
             entry_point: Some("main"),
@@ -1362,6 +1636,554 @@ impl GpuContext {
 
         // Read back results using cross-platform helper
         read_buffer_into_sync(&self.device, &staging_buffer, a);
+    }
+
+    // ==================== BUFFER-TO-BUFFER OPERATIONS ====================
+    // These operations work on persistent GPU buffers without CPU readback.
+    // They encode commands to the provided encoder for batched submission.
+
+    /// Get a reference to the device
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    /// Get a reference to the queue
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    /// Get a cloned Arc reference to the device
+    pub fn device_arc(&self) -> Arc<wgpu::Device> {
+        Arc::clone(&self.device)
+    }
+
+    /// Get a cloned Arc reference to the queue
+    pub fn queue_arc(&self) -> Arc<wgpu::Queue> {
+        Arc::clone(&self.queue)
+    }
+
+    /// Matrix multiply on buffers: C = A * B (no readback)
+    /// A is (m x k), B is (k x n), C is (m x n)
+    pub fn matmul_buffers(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        a_buffer: &wgpu::Buffer,
+        b_buffer: &wgpu::Buffer,
+        c_buffer: &wgpu::Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        use wgpu::util::DeviceExt;
+
+        let dims = MatrixDims {
+            m: m as u32,
+            k: k as u32,
+            n: n as u32,
+            _pad: 0,
+        };
+
+        let dims_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Dims Buffer"),
+            contents: bytemuck::bytes_of(&dims),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let bind_group_layout = self.matmul_pipeline.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("MatMul Buffer Bind Group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: dims_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: a_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: b_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: c_buffer.as_entire_binding() },
+            ],
+        });
+
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("MatMul Buffer Pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.matmul_pipeline);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            let workgroups_x = (m as u32 + 7) / 8;
+            let workgroups_y = (n as u32 + 7) / 8;
+            cpass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
+        }
+    }
+
+    /// Apply ReLU in-place on a buffer (no readback)
+    pub fn relu_buffer(&self, encoder: &mut wgpu::CommandEncoder, buffer: &wgpu::Buffer, size: usize) {
+        use wgpu::util::DeviceExt;
+
+        let dims = VectorDims {
+            size: size as u32,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
+        };
+
+        let dims_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Dims Buffer"),
+            contents: bytemuck::bytes_of(&dims),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let bind_group_layout = self.relu_pipeline.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ReLU Buffer Bind Group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: dims_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: buffer.as_entire_binding() },
+            ],
+        });
+
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("ReLU Buffer Pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.relu_pipeline);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            let workgroups = (size as u32 + 63) / 64;
+            cpass.dispatch_workgroups(workgroups, 1, 1);
+        }
+    }
+
+    /// Add bias to buffer in-place (no readback)
+    pub fn add_bias_buffer(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        data_buffer: &wgpu::Buffer,
+        bias_buffer: &wgpu::Buffer,
+        size: usize,
+    ) {
+        use wgpu::util::DeviceExt;
+
+        let dims = VectorDims {
+            size: size as u32,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
+        };
+
+        let dims_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Dims Buffer"),
+            contents: bytemuck::bytes_of(&dims),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let bind_group_layout = self.add_bias_pipeline.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Add Bias Buffer Bind Group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: dims_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: data_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: bias_buffer.as_entire_binding() },
+            ],
+        });
+
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Add Bias Buffer Pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.add_bias_pipeline);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            let workgroups = (size as u32 + 63) / 64;
+            cpass.dispatch_workgroups(workgroups, 1, 1);
+        }
+    }
+
+    /// Matrix multiply with A transposed on buffers: C = A^T * B (no readback)
+    pub fn matmul_at_b_buffers(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        a_buffer: &wgpu::Buffer,
+        b_buffer: &wgpu::Buffer,
+        c_buffer: &wgpu::Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        use wgpu::util::DeviceExt;
+
+        let dims = MatrixDims {
+            m: m as u32,
+            k: k as u32,
+            n: n as u32,
+            _pad: 0,
+        };
+
+        let dims_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Dims Buffer"),
+            contents: bytemuck::bytes_of(&dims),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let bind_group_layout = self.matmul_at_b_pipeline.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("MatMul A^T*B Buffer Bind Group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: dims_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: a_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: b_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: c_buffer.as_entire_binding() },
+            ],
+        });
+
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("MatMul A^T*B Buffer Pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.matmul_at_b_pipeline);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            let workgroups_x = (m as u32 + 7) / 8;
+            let workgroups_y = (n as u32 + 7) / 8;
+            cpass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
+        }
+    }
+
+    /// Matrix multiply with B transposed on buffers: C = A * B^T (no readback)
+    pub fn matmul_a_bt_buffers(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        a_buffer: &wgpu::Buffer,
+        b_buffer: &wgpu::Buffer,
+        c_buffer: &wgpu::Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        use wgpu::util::DeviceExt;
+
+        let dims = MatrixDims {
+            m: m as u32,
+            k: k as u32,
+            n: n as u32,
+            _pad: 0,
+        };
+
+        let dims_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Dims Buffer"),
+            contents: bytemuck::bytes_of(&dims),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let bind_group_layout = self.matmul_a_bt_pipeline.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("MatMul A*B^T Buffer Bind Group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: dims_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: a_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: b_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: c_buffer.as_entire_binding() },
+            ],
+        });
+
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("MatMul A*B^T Buffer Pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.matmul_a_bt_pipeline);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            let workgroups_x = (m as u32 + 7) / 8;
+            let workgroups_y = (n as u32 + 7) / 8;
+            cpass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
+        }
+    }
+
+    /// ReLU backward on buffers (no readback)
+    pub fn relu_backward_buffer(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        grad_buffer: &wgpu::Buffer,
+        pre_activation_buffer: &wgpu::Buffer,
+        size: usize,
+    ) {
+        use wgpu::util::DeviceExt;
+
+        let dims = VectorDims {
+            size: size as u32,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
+        };
+
+        let dims_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Dims Buffer"),
+            contents: bytemuck::bytes_of(&dims),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let bind_group_layout = self.relu_backward_pipeline.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ReLU Backward Buffer Bind Group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: dims_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: grad_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: pre_activation_buffer.as_entire_binding() },
+            ],
+        });
+
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("ReLU Backward Buffer Pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.relu_backward_pipeline);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            let workgroups = (size as u32 + 63) / 64;
+            cpass.dispatch_workgroups(workgroups, 1, 1);
+        }
+    }
+
+    /// SAXPY on buffers: y = alpha * x + y (no readback)
+    pub fn saxpy_buffer(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        x_buffer: &wgpu::Buffer,
+        y_buffer: &wgpu::Buffer,
+        alpha: f32,
+        size: usize,
+    ) {
+        use wgpu::util::DeviceExt;
+
+        let params = SaxpyParams {
+            size: size as u32,
+            _pad1: 0,
+            alpha,
+            _pad2: 0,
+        };
+
+        let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Params Buffer"),
+            contents: bytemuck::bytes_of(&params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let bind_group_layout = self.saxpy_pipeline.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("SAXPY Buffer Bind Group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: x_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: y_buffer.as_entire_binding() },
+            ],
+        });
+
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("SAXPY Buffer Pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.saxpy_pipeline);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            let workgroups = (size as u32 + 63) / 64;
+            cpass.dispatch_workgroups(workgroups, 1, 1);
+        }
+    }
+
+    /// Softmax activation in-place on a GPU buffer
+    /// Uses workgroup shared memory for efficient parallel reduction
+    /// Only supports sizes up to 64 (sufficient for MNIST 10-class output)
+    pub fn softmax_buffer(&self, encoder: &mut wgpu::CommandEncoder, buffer: &wgpu::Buffer, size: usize) {
+        use wgpu::util::DeviceExt;
+
+        let params = VectorDims {
+            size: size as u32,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
+        };
+
+        let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Softmax Params Buffer"),
+            contents: bytemuck::bytes_of(&params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let bind_group_layout = self.softmax_pipeline.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Softmax Buffer Bind Group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: buffer.as_entire_binding() },
+            ],
+        });
+
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Softmax Buffer Pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.softmax_pipeline);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            // Softmax uses a single workgroup with shared memory
+            cpass.dispatch_workgroups(1, 1, 1);
+        }
+    }
+
+    /// Compute output layer delta: delta = softmax_output - one_hot(label)
+    /// For softmax + cross-entropy loss, this is the gradient of loss w.r.t. pre-softmax logits
+    pub fn output_delta_buffer(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        output_buffer: &wgpu::Buffer,
+        delta_buffer: &wgpu::Buffer,
+        label: u32,
+        size: usize,
+    ) {
+        use wgpu::util::DeviceExt;
+
+        let params = OutputDeltaParams {
+            size: size as u32,
+            label,
+            _pad1: 0,
+            _pad2: 0,
+        };
+
+        let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Output Delta Params Buffer"),
+            contents: bytemuck::bytes_of(&params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let bind_group_layout = self.output_delta_pipeline.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Output Delta Buffer Bind Group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: output_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: delta_buffer.as_entire_binding() },
+            ],
+        });
+
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Output Delta Buffer Pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.output_delta_pipeline);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            let workgroups = (size as u32 + 63) / 64;
+            cpass.dispatch_workgroups(workgroups, 1, 1);
+        }
+    }
+
+    /// Zero a GPU buffer (set all elements to 0)
+    /// Used to reset gradient accumulators at the start of each batch
+    pub fn zero_buffer(&self, encoder: &mut wgpu::CommandEncoder, buffer: &wgpu::Buffer, size: usize) {
+        use wgpu::util::DeviceExt;
+
+        let params = VectorDims {
+            size: size as u32,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
+        };
+
+        let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Zero Buffer Params"),
+            contents: bytemuck::bytes_of(&params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let bind_group_layout = self.zero_buffer_pipeline.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Zero Buffer Bind Group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: buffer.as_entire_binding() },
+            ],
+        });
+
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Zero Buffer Pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.zero_buffer_pipeline);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            let workgroups = (size as u32 + 63) / 64;
+            cpass.dispatch_workgroups(workgroups, 1, 1);
+        }
+    }
+
+    /// Scale a GPU buffer by a scalar (multiply all elements by scale)
+    /// Used to average gradients by multiplying by 1/batch_size
+    pub fn scale_buffer(&self, encoder: &mut wgpu::CommandEncoder, buffer: &wgpu::Buffer, scale: f32, size: usize) {
+        use wgpu::util::DeviceExt;
+
+        let params = ScaleParams {
+            size: size as u32,
+            _pad1: 0,
+            scale,
+            _pad2: 0,
+        };
+
+        let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Scale Buffer Params"),
+            contents: bytemuck::bytes_of(&params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let bind_group_layout = self.scale_buffer_pipeline.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Scale Buffer Bind Group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: buffer.as_entire_binding() },
+            ],
+        });
+
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Scale Buffer Pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.scale_buffer_pipeline);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            let workgroups = (size as u32 + 63) / 64;
+            cpass.dispatch_workgroups(workgroups, 1, 1);
+        }
+    }
+
+    /// Copy data from a GPU buffer to a staging buffer for later async read
+    pub fn copy_to_staging(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        src_buffer: &wgpu::Buffer,
+        staging_buffer: &wgpu::Buffer,
+        size: u64,
+    ) {
+        encoder.copy_buffer_to_buffer(src_buffer, 0, staging_buffer, 0, size);
+    }
+
+    /// Create a command encoder
+    pub fn create_encoder(&self, label: &str) -> wgpu::CommandEncoder {
+        self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some(label),
+        })
+    }
+
+    /// Submit commands to the queue
+    pub fn submit(&self, encoder: wgpu::CommandEncoder) {
+        self.queue.submit(Some(encoder.finish()));
     }
 }
 

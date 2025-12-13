@@ -4,7 +4,7 @@ use wasm_bindgen::prelude::*;
 use web_sys::{CanvasRenderingContext2d, Document, HtmlCanvasElement, HtmlElement, MouseEvent, WheelEvent};
 
 #[cfg(feature = "gpu")]
-use neural::GpuNetwork;
+use neural::{GpuNetwork, WeightSyncState};
 
 const INPUT_PANEL_WIDTH: f64 = 200.0;
 const NEURON_RADIUS: f64 = 8.0;  // Smaller neurons
@@ -546,6 +546,15 @@ fn sync_network_from_gpu() {
 }
 
 /// Train batches using GPU acceleration
+///
+/// Full GPU training - works in both WASM and native
+///
+/// This uses `train_batch_gpu_full()` which runs the entire training loop on GPU:
+/// - Forward pass: matmul -> add_bias -> activation (relu/softmax)
+/// - Backward pass: output_delta -> matmul for gradients -> relu_backward
+/// - Weight updates: saxpy for SGD
+///
+/// No CPU readback during training - only sync weights periodically for metrics.
 #[cfg(feature = "gpu")]
 fn train_batches_gpu(state: &mut State, num_batches: usize) {
     let total_samples = state.samples.len();
@@ -561,6 +570,11 @@ fn train_batches_gpu(state: &mut State, num_batches: usize) {
             }
         };
 
+        // Initialize persistent buffers if not already done
+        if !gpu_net.has_persistent_buffers() {
+            gpu_net.init_persistent_buffers();
+        }
+
         for _ in 0..num_batches {
             if state.training_state != TrainingState::Training {
                 break;
@@ -571,18 +585,52 @@ fn train_batches_gpu(state: &mut State, num_batches: usize) {
             let end = (start + BATCH_SIZE).min(total_samples);
 
             if start >= total_samples {
-                // End of epoch - sync weights back to CPU and update state
+                // End of epoch - sync weights back to CPU and update metrics
                 state.metrics.epoch += 1;
                 state.current_batch_idx = 0;
 
-                // Stop training if accuracy is good enough or max epochs reached
-                if state.metrics.accuracy >= 0.99 || state.metrics.epoch >= 10 {
-                    state.training_state = TrainingState::Paused;
-                    // Sync final weights back to CPU for visualization
+                // Sync weights from GPU to CPU for evaluation
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    gpu_net.sync_weights_to_cpu();
+                    // Copy synced weights to visualization state
                     for (cpu_layer, gpu_layer) in state.network.layers.iter_mut().zip(gpu_net.network().layers.iter()) {
                         cpu_layer.weights.copy_from_slice(&gpu_layer.weights);
                         cpu_layer.biases.copy_from_slice(&gpu_layer.biases);
                     }
+                }
+
+                // Evaluate accuracy at epoch end
+                let val_size = 500;
+                let val_start = state.digits.len().saturating_sub(val_size);
+                let eval_inputs: Vec<Vec<f32>> = state.digits[val_start..]
+                    .iter()
+                    .map(|d| d.pixels().iter().map(|&p| p as f32 / 255.0).collect())
+                    .collect();
+                let eval_labels: Vec<u8> = state.digits[val_start..]
+                    .iter()
+                    .map(|d| d.label())
+                    .collect();
+
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let (loss, acc) = state.network.evaluate(&eval_inputs, &eval_labels);
+                    state.metrics.accuracy = acc;
+                    state.metrics.loss = loss;
+                }
+
+                // For WASM, start async weight sync - completion handled at next frame start
+                #[cfg(target_arch = "wasm32")]
+                {
+                    // Always start a sync at epoch boundary for accurate metrics
+                    if gpu_net.weight_sync_state() == WeightSyncState::Idle {
+                        gpu_net.start_weight_sync();
+                    }
+                }
+
+                // Stop training if accuracy is good enough or max epochs reached
+                if state.metrics.accuracy >= 0.99 || state.metrics.epoch >= 10 {
+                    state.training_state = TrainingState::Paused;
                     break;
                 }
 
@@ -599,20 +647,19 @@ fn train_batches_gpu(state: &mut State, num_batches: usize) {
                 .collect();
             let labels: Vec<u8> = state.samples[start..end].iter().map(|s| s.label()).collect();
 
-            // Train batch on GPU
-            let loss = gpu_net.train_batch(&inputs, &labels, LEARNING_RATE);
+            // Train batch on GPU using full GPU training (no CPU readback)
+            let samples_trained = gpu_net.train_batch_gpu_full(&inputs, &labels, LEARNING_RATE);
 
             // Update metrics
             state.metrics.batch = state.current_batch_idx;
             state.metrics.total_batches = num_total_batches;
-            state.metrics.samples_seen += inputs.len();
-            state.metrics.loss = loss;
-            state.metrics.loss_history.push(loss);
+            state.metrics.samples_seen += samples_trained;
 
-            // Evaluate accuracy periodically (every 10 batches) using CPU network
-            // First sync weights from GPU to CPU for evaluation
-            if state.current_batch_idx % 10 == 0 {
-                // Sync GPU weights to CPU for evaluation
+            // For native, sync weights and evaluate periodically
+            #[cfg(not(target_arch = "wasm32"))]
+            if state.current_batch_idx % 50 == 0 {
+                // Sync GPU weights to CPU for evaluation (blocking)
+                gpu_net.sync_weights_to_cpu();
                 for (cpu_layer, gpu_layer) in state.network.layers.iter_mut().zip(gpu_net.network().layers.iter()) {
                     cpu_layer.weights.copy_from_slice(&gpu_layer.weights);
                     cpu_layer.biases.copy_from_slice(&gpu_layer.biases);
@@ -628,8 +675,21 @@ fn train_batches_gpu(state: &mut State, num_batches: usize) {
                     .iter()
                     .map(|d| d.label())
                     .collect();
-                let (_, acc) = state.network.evaluate(&eval_inputs, &eval_labels);
+                let (loss, acc) = state.network.evaluate(&eval_inputs, &eval_labels);
                 state.metrics.accuracy = acc;
+                state.metrics.loss = loss;
+                state.metrics.loss_history.push(loss);
+            }
+
+            // For WASM, start weight sync periodically (completion is handled at frame start)
+            #[cfg(target_arch = "wasm32")]
+            {
+                // Start a new sync periodically (every 50 batches) if not already syncing
+                if state.current_batch_idx % 50 == 0 && state.current_batch_idx > 0 {
+                    if gpu_net.weight_sync_state() == WeightSyncState::Idle {
+                        gpu_net.start_weight_sync();
+                    }
+                }
             }
 
             state.current_batch_idx += 1;
@@ -1186,12 +1246,62 @@ fn setup_handlers(document: &Document) -> Result<(), JsValue> {
     Ok(())
 }
 
+/// Poll for async weight sync completion at the start of each frame
+/// This is called before training new batches to check if previous sync completed
+#[cfg(all(feature = "gpu", target_arch = "wasm32"))]
+fn poll_gpu_weight_sync(state: &mut State) {
+    GPU_NETWORK.with(|gpu| {
+        let mut gpu_borrow = gpu.borrow_mut();
+        if let Some(gpu_net) = gpu_borrow.as_mut() {
+            // Only poll if we're actually using GPU mode
+            if state.accelerator_mode != AcceleratorMode::Gpu || state.gpu_init_state != GpuInitState::Ready {
+                return;
+            }
+
+            let sync_state = gpu_net.poll_weight_sync();
+
+            if sync_state == WeightSyncState::Complete {
+
+                // Weights synced! Copy to visualization state and evaluate
+                for (cpu_layer, gpu_layer) in state.network.layers.iter_mut().zip(gpu_net.network().layers.iter()) {
+                    cpu_layer.weights.copy_from_slice(&gpu_layer.weights);
+                    cpu_layer.biases.copy_from_slice(&gpu_layer.biases);
+                }
+
+                // Evaluate with real weights
+                let val_size = 500;
+                let val_start = state.digits.len().saturating_sub(val_size);
+                let eval_inputs: Vec<Vec<f32>> = state.digits[val_start..]
+                    .iter()
+                    .map(|d| d.pixels().iter().map(|&p| p as f32 / 255.0).collect())
+                    .collect();
+                let eval_labels: Vec<u8> = state.digits[val_start..]
+                    .iter()
+                    .map(|d| d.label())
+                    .collect();
+                let (loss, acc) = state.network.evaluate(&eval_inputs, &eval_labels);
+                state.metrics.accuracy = acc;
+                state.metrics.loss = loss;
+                state.metrics.loss_history.push(loss);
+
+                // Reset sync state for next evaluation
+                gpu_net.reset_weight_sync();
+            }
+        }
+    });
+}
+
 fn start_training_loop(document: Document) {
     let window = web_sys::window().unwrap();
 
     let closure = Closure::wrap(Box::new(move || {
         let is_training = STATE.with(|state| {
             if let Some(ref mut s) = *state.borrow_mut() {
+                // Poll for async weight sync completion at the START of each frame
+                // This is when the async callbacks will have fired from the previous frame
+                #[cfg(all(feature = "gpu", target_arch = "wasm32"))]
+                poll_gpu_weight_sync(s);
+
                 if s.training_state == TrainingState::Training {
                     // Check if we should use GPU training
                     #[cfg(feature = "gpu")]
@@ -1200,15 +1310,34 @@ fn start_training_loop(document: Document) {
                     #[cfg(not(feature = "gpu"))]
                     let use_gpu = false;
 
-                    if use_gpu {
+                    // In WASM with GPU: don't train while weight sync is in progress
+                    // Training commands would queue up and delay the sync completion
+                    #[cfg(all(feature = "gpu", target_arch = "wasm32"))]
+                    let skip_training = {
+                        if use_gpu {
+                            GPU_NETWORK.with(|gpu| {
+                                gpu.borrow().as_ref().map(|g| g.is_syncing_weights()).unwrap_or(false)
+                            })
+                        } else {
+                            false
+                        }
+                    };
+                    #[cfg(not(all(feature = "gpu", target_arch = "wasm32")))]
+                    let skip_training = false;
+
+                    if skip_training {
+                        // Skip training this frame to let weight sync complete
+                        true
+                    } else if use_gpu {
                         #[cfg(feature = "gpu")]
                         {
                             train_batches_gpu(s, BATCHES_PER_FRAME);
                         }
+                        true
                     } else {
                         s.train_batches(BATCHES_PER_FRAME);
+                        true
                     }
-                    true
                 } else {
                     false
                 }
