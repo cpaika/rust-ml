@@ -994,9 +994,9 @@ fn setup_ui(document: &Document, canvas_width: u32, canvas_height: u32) -> Resul
     let title = document.create_element("div")?;
     title.set_attribute(
         "style",
-        &format!("color: {}; font-size: 16px; font-weight: 600;", ACCENT_COLOR),
+        &format!("color: {}; font-size: 15px; font-weight: 600;", ACCENT_COLOR),
     )?;
-    title.set_text_content(Some("MNIST Trainer"));
+    title.set_text_content(Some("Train an MNIST classifier"));
     left_panel.append_child(&title)?;
 
     // Training Controls Section
