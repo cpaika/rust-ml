@@ -977,8 +977,9 @@ fn setup_ui(document: &Document, canvas_width: u32, canvas_height: u32) -> Resul
     left_panel.set_attribute(
         "style",
         &format!(
-            "width: {}px; background: {}; padding: 20px; box-sizing: border-box; \
-             display: flex; flex-direction: column; gap: 16px; border-right: 1px solid #1a1a2e;",
+            "width: {}px; background: {}; padding: 10px; box-sizing: border-box; \
+             display: flex; flex-direction: column; gap: 6px; border-right: 1px solid #1a1a2e; \
+             overflow-y: auto;",
             INPUT_PANEL_WIDTH as u32, PANEL_BG
         ),
     )?;
@@ -987,14 +988,14 @@ fn setup_ui(document: &Document, canvas_width: u32, canvas_height: u32) -> Resul
     let title = document.create_element("div")?;
     title.set_attribute(
         "style",
-        &format!("color: {}; font-size: 18px; font-weight: 600; margin-bottom: 8px;", ACCENT_COLOR),
+        &format!("color: {}; font-size: 16px; font-weight: 600;", ACCENT_COLOR),
     )?;
     title.set_text_content(Some("MNIST Trainer"));
     left_panel.append_child(&title)?;
 
     // Training Controls Section
     let controls_section = document.create_element("div")?;
-    controls_section.set_attribute("style", "display: flex; flex-direction: column; gap: 8px;")?;
+    controls_section.set_attribute("style", "display: flex; flex-direction: column; gap: 6px;")?;
 
     // Start/Stop Button
     let train_btn = document.create_element("button")?;
@@ -1003,8 +1004,8 @@ fn setup_ui(document: &Document, canvas_width: u32, canvas_height: u32) -> Resul
     train_btn.set_attribute(
         "style",
         &format!(
-            "width: 100%; padding: 12px; font-size: 14px; cursor: pointer; \
-             background: {}; color: {}; border: none; border-radius: 8px; \
+            "width: 100%; padding: 8px; font-size: 12px; cursor: pointer; \
+             background: {}; color: {}; border: none; border-radius: 6px; \
              font-weight: 600; transition: all 0.2s;",
             ACCENT_COLOR, BG_COLOR
         ),
@@ -1018,8 +1019,8 @@ fn setup_ui(document: &Document, canvas_width: u32, canvas_height: u32) -> Resul
     reset_btn.set_attribute(
         "style",
         &format!(
-            "width: 100%; padding: 10px; font-size: 13px; cursor: pointer; \
-             background: transparent; color: {}; border: 1px solid {}; border-radius: 8px; \
+            "width: 100%; padding: 8px; font-size: 12px; cursor: pointer; \
+             background: transparent; color: {}; border: 1px solid {}; border-radius: 6px; \
              transition: all 0.2s;",
             ACCENT_SECONDARY, ACCENT_SECONDARY
         ),
@@ -1033,9 +1034,9 @@ fn setup_ui(document: &Document, canvas_width: u32, canvas_height: u32) -> Resul
     gpu_btn.set_attribute(
         "style",
         &format!(
-            "width: 100%; padding: 10px; font-size: 13px; cursor: pointer; \
-             background: #1a2a3a; color: {}; border: 1px solid {}; border-radius: 8px; \
-             transition: all 0.2s; margin-top: 8px;",
+            "width: 100%; padding: 8px; font-size: 12px; cursor: pointer; \
+             background: #1a2a3a; color: {}; border: 1px solid {}; border-radius: 6px; \
+             transition: all 0.2s;",
             TEXT_COLOR, NEURON_STROKE
         ),
     )?;
@@ -1061,18 +1062,18 @@ fn setup_ui(document: &Document, canvas_width: u32, canvas_height: u32) -> Resul
     metrics_section.set_attribute(
         "style",
         &format!(
-            "background: {}; border-radius: 8px; padding: 12px; \
+            "background: {}; border-radius: 6px; padding: 8px; \
              border: 1px solid #1a1a2e;",
             BG_COLOR
         ),
     )?;
     metrics_section.set_inner_html(&format!(
-        "<div style='color: {}; font-size: 12px; margin-bottom: 8px; font-weight: 600;'>TRAINING METRICS</div>\
-         <div id='metric-epoch' style='color: {}; font-size: 13px; margin-bottom: 4px;'>Epoch: 0</div>\
-         <div id='metric-batch' style='color: {}; font-size: 13px; margin-bottom: 4px;'>Batch: 0/0</div>\
-         <div id='metric-loss' style='color: {}; font-size: 13px; margin-bottom: 4px;'>Loss: -</div>\
-         <div id='metric-accuracy' style='color: {}; font-size: 13px; margin-bottom: 4px;'>Accuracy: -</div>\
-         <div id='metric-flops' style='color: {}; font-size: 13px;'>FLOPS: -</div>",
+        "<div style='color: {}; font-size: 11px; margin-bottom: 4px; font-weight: 600;'>TRAINING METRICS</div>\
+         <div id='metric-epoch' style='color: {}; font-size: 12px; margin-bottom: 2px;'>Epoch: 0</div>\
+         <div id='metric-batch' style='color: {}; font-size: 12px; margin-bottom: 2px;'>Batch: 0/0</div>\
+         <div id='metric-loss' style='color: {}; font-size: 12px; margin-bottom: 2px;'>Loss: -</div>\
+         <div id='metric-accuracy' style='color: {}; font-size: 12px; margin-bottom: 2px;'>Accuracy: -</div>\
+         <div id='metric-flops' style='color: {}; font-size: 12px;'>FLOPS: -</div>",
         TEXT_DIM, TEXT_COLOR, TEXT_COLOR, TEXT_COLOR, TEXT_COLOR, TEXT_COLOR
     ));
     left_panel.append_child(&metrics_section)?;
@@ -1081,7 +1082,7 @@ fn setup_ui(document: &Document, canvas_width: u32, canvas_height: u32) -> Resul
     let chart_canvas = document.create_element("canvas")?.dyn_into::<HtmlCanvasElement>()?;
     chart_canvas.set_id("loss-chart");
     chart_canvas.set_width(160);
-    chart_canvas.set_height(80);
+    chart_canvas.set_height(70);
     chart_canvas.set_attribute(
         "style",
         &format!("background: {}; border-radius: 8px; border: 1px solid #1a1a2e;", BG_COLOR),
@@ -1092,7 +1093,7 @@ fn setup_ui(document: &Document, canvas_width: u32, canvas_height: u32) -> Resul
     let scale_container = document.create_element("div")?;
     scale_container.set_attribute(
         "style",
-        "display: flex; gap: 4px; margin-top: 6px;",
+        "display: flex; gap: 4px; margin-top: 4px;",
     )?;
 
     // Linear scale button
@@ -1144,14 +1145,14 @@ fn setup_ui(document: &Document, canvas_width: u32, canvas_height: u32) -> Resul
 
     // Divider
     let divider = document.create_element("div")?;
-    divider.set_attribute("style", "height: 1px; background: #1a1a2e; margin: 8px 0;")?;
+    divider.set_attribute("style", "height: 1px; background: #1a1a2e; margin: 4px 0;")?;
     left_panel.append_child(&divider)?;
 
     // Sample Section
     let sample_label = document.create_element("div")?;
     sample_label.set_attribute(
         "style",
-        &format!("color: {}; font-size: 12px; font-weight: 600;", TEXT_DIM),
+        &format!("color: {}; font-size: 11px; font-weight: 600;", TEXT_DIM),
     )?;
     sample_label.set_text_content(Some("CURRENT SAMPLE"));
     left_panel.append_child(&sample_label)?;
@@ -1163,8 +1164,8 @@ fn setup_ui(document: &Document, canvas_width: u32, canvas_height: u32) -> Resul
     load_btn.set_attribute(
         "style",
         &format!(
-            "width: 100%; padding: 10px; font-size: 13px; cursor: pointer; \
-             background: transparent; color: {}; border: 1px solid {}; border-radius: 8px; \
+            "width: 100%; padding: 8px; font-size: 12px; cursor: pointer; \
+             background: transparent; color: {}; border: 1px solid {}; border-radius: 6px; \
              transition: all 0.2s;",
             NEURON_STROKE, NEURON_STROKE
         ),
@@ -1178,9 +1179,9 @@ fn setup_ui(document: &Document, canvas_width: u32, canvas_height: u32) -> Resul
     draw_btn.set_attribute(
         "style",
         &format!(
-            "width: 100%; padding: 10px; font-size: 13px; cursor: pointer; \
-             background: transparent; color: {}; border: 1px solid {}; border-radius: 8px; \
-             transition: all 0.2s; margin-top: 6px;",
+            "width: 100%; padding: 8px; font-size: 12px; cursor: pointer; \
+             background: transparent; color: {}; border: 1px solid {}; border-radius: 6px; \
+             transition: all 0.2s;",
             ACCENT_SECONDARY, ACCENT_SECONDARY
         ),
     )?;
@@ -1191,7 +1192,7 @@ fn setup_ui(document: &Document, canvas_width: u32, canvas_height: u32) -> Resul
     draw_controls.set_id("draw-controls");
     draw_controls.set_attribute(
         "style",
-        "display: none; flex-direction: row; gap: 6px; margin-top: 6px;",
+        "display: none; flex-direction: row; gap: 4px;",
     )?;
 
     // Clear button
@@ -1201,8 +1202,8 @@ fn setup_ui(document: &Document, canvas_width: u32, canvas_height: u32) -> Resul
     clear_btn.set_attribute(
         "style",
         &format!(
-            "flex: 1; padding: 8px; font-size: 12px; cursor: pointer; \
-             background: transparent; color: {}; border: 1px solid {}; border-radius: 6px;",
+            "flex: 1; padding: 6px; font-size: 11px; cursor: pointer; \
+             background: transparent; color: {}; border: 1px solid {}; border-radius: 4px;",
             TEXT_DIM, NEURON_STROKE
         ),
     )?;
@@ -1215,8 +1216,8 @@ fn setup_ui(document: &Document, canvas_width: u32, canvas_height: u32) -> Resul
     done_btn.set_attribute(
         "style",
         &format!(
-            "flex: 1; padding: 8px; font-size: 12px; cursor: pointer; \
-             background: {}; color: {}; border: none; border-radius: 6px;",
+            "flex: 1; padding: 6px; font-size: 11px; cursor: pointer; \
+             background: {}; color: {}; border: none; border-radius: 4px;",
             ACCENT_COLOR, BG_COLOR
         ),
     )?;
@@ -1230,7 +1231,7 @@ fn setup_ui(document: &Document, canvas_width: u32, canvas_height: u32) -> Resul
     draw_label.set_attribute(
         "style",
         &format!(
-            "display: none; color: {}; font-size: 11px; text-align: center; margin-top: 4px;",
+            "display: none; color: {}; font-size: 10px; text-align: center;",
             ACCENT_SECONDARY
         ),
     )?;
@@ -1240,8 +1241,8 @@ fn setup_ui(document: &Document, canvas_width: u32, canvas_height: u32) -> Resul
     // Digit display
     let digit_canvas = document.create_element("canvas")?.dyn_into::<HtmlCanvasElement>()?;
     digit_canvas.set_id("digit-canvas");
-    digit_canvas.set_width(140);
-    digit_canvas.set_height(140);
+    digit_canvas.set_width(120);
+    digit_canvas.set_height(120);
     digit_canvas.set_attribute(
         "style",
         &format!("background: {}; border: 2px solid {}; border-radius: 8px; align-self: center;", BG_COLOR, NEURON_STROKE),
@@ -1254,8 +1255,8 @@ fn setup_ui(document: &Document, canvas_width: u32, canvas_height: u32) -> Resul
     prediction_div.set_attribute(
         "style",
         &format!(
-            "color: {}; text-align: center; font-size: 14px; padding: 8px; \
-             background: {}; border-radius: 8px;",
+            "color: {}; text-align: center; font-size: 12px; padding: 6px; \
+             background: {}; border-radius: 6px;",
             TEXT_COLOR, BG_COLOR
         ),
     )?;
@@ -1656,7 +1657,7 @@ fn setup_handlers(document: &Document) -> Result<(), JsValue> {
     // Mouse down on digit canvas - start drawing
     let doc_clone = document.clone();
     let digit_mousedown = Closure::wrap(Box::new(move |event: MouseEvent| {
-        let canvas_size = 140.0;
+        let canvas_size = 120.0;
         let x = event.offset_x() as f64;
         let y = event.offset_y() as f64;
 
@@ -1680,7 +1681,7 @@ fn setup_handlers(document: &Document) -> Result<(), JsValue> {
     // Mouse move on digit canvas - continue drawing
     let doc_clone = document.clone();
     let digit_mousemove = Closure::wrap(Box::new(move |event: MouseEvent| {
-        let canvas_size = 140.0;
+        let canvas_size = 120.0;
         let x = event.offset_x() as f64;
         let y = event.offset_y() as f64;
 
@@ -2580,8 +2581,10 @@ fn render_digit(document: &Document) -> Result<(), JsValue> {
         let state = state.borrow();
         if let Some(ref s) = *state {
             // Clear canvas
+            let canvas_size = 120.0;
+            let scale = canvas_size / 28.0;
             ctx.set_fill_style_str(BG_COLOR);
-            ctx.fill_rect(0.0, 0.0, 140.0, 140.0);
+            ctx.fill_rect(0.0, 0.0, canvas_size, canvas_size);
 
             // Get pixels to render - either from drawing or from loaded validation digit
             let pixels: Option<&[u8]> = if s.drawing_mode {
@@ -2593,7 +2596,7 @@ fn render_digit(document: &Document) -> Result<(), JsValue> {
             };
 
             if let Some(pixels) = pixels {
-                // Draw digit scaled 5x
+                // Draw digit scaled to fit canvas
                 for row in 0..28 {
                     for col in 0..28 {
                         let pixel_idx = row * 28 + col;
@@ -2607,14 +2610,14 @@ fn render_digit(document: &Document) -> Result<(), JsValue> {
                             let g = (205.0 * (1.0 - intensity) + 205.0 * intensity) as u8;
                             let b = (196.0 * (1.0 - intensity) + 196.0 * intensity) as u8;
                             ctx.set_fill_style_str(&format!("rgb({},{},{})", r, g, b));
-                            ctx.fill_rect(col as f64 * 5.0, row as f64 * 5.0, 5.0, 5.0);
+                            ctx.fill_rect(col as f64 * scale, row as f64 * scale, scale, scale);
                         }
 
                         // Draw highlight border for hovered pixel
                         if is_hovered {
                             ctx.set_stroke_style_str(ACCENT_COLOR);
                             ctx.set_line_width(2.0);
-                            ctx.stroke_rect(col as f64 * 5.0, row as f64 * 5.0, 5.0, 5.0);
+                            ctx.stroke_rect(col as f64 * scale, row as f64 * scale, scale, scale);
                         }
                     }
                 }
@@ -2623,18 +2626,18 @@ fn render_digit(document: &Document) -> Result<(), JsValue> {
                 if s.drawing_mode {
                     ctx.set_stroke_style_str("rgba(61, 90, 128, 0.2)");
                     ctx.set_line_width(0.5);
-                    // Vertical lines every 5 pixels (1 MNIST pixel)
+                    // Vertical lines every scale pixels (1 MNIST pixel)
                     for i in 0..=28 {
                         ctx.begin_path();
-                        ctx.move_to(i as f64 * 5.0, 0.0);
-                        ctx.line_to(i as f64 * 5.0, 140.0);
+                        ctx.move_to(i as f64 * scale, 0.0);
+                        ctx.line_to(i as f64 * scale, canvas_size);
                         ctx.stroke();
                     }
                     // Horizontal lines
                     for i in 0..=28 {
                         ctx.begin_path();
-                        ctx.move_to(0.0, i as f64 * 5.0);
-                        ctx.line_to(140.0, i as f64 * 5.0);
+                        ctx.move_to(0.0, i as f64 * scale);
+                        ctx.line_to(canvas_size, i as f64 * scale);
                         ctx.stroke();
                     }
                 }
