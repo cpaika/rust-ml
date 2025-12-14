@@ -8,6 +8,7 @@ use neural::{GpuNetwork, WeightSyncState};
 
 const INPUT_PANEL_WIDTH: f64 = 200.0;
 const NEURON_RADIUS: f64 = 8.0;  // Smaller neurons
+const OUTPUT_NEURON_RADIUS: f64 = 18.0;  // Larger output neurons for visibility
 const LAYER_SPACING: f64 = 250.0;
 
 // Modern color palette
@@ -40,6 +41,7 @@ enum TrainingState {
     Idle,
     Training,
     Paused,
+    Completed,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -194,11 +196,11 @@ impl State {
                     });
                 }
             } else {
-                // Output layer: column layout (only 10 neurons)
+                // Output layer: column layout (only 10 neurons, larger size)
                 let layer_x = INPUT_PANEL_WIDTH + 100.0 + (layer_idx as f64) * LAYER_SPACING;
 
-                // Calculate spacing to fit all neurons with room
-                let neuron_spacing = (NEURON_RADIUS * 2.5).min(available_height / actual_size as f64);
+                // Calculate spacing to fit all neurons with room (use larger output radius)
+                let neuron_spacing = (OUTPUT_NEURON_RADIUS * 2.5).min(available_height / actual_size as f64);
                 let total_height = (actual_size - 1) as f64 * neuron_spacing;
                 let start_y = (canvas_height - total_height) / 2.0;
 
@@ -225,12 +227,17 @@ impl State {
 
     fn get_neuron_at(&self, screen_x: f64, screen_y: f64) -> Option<(usize, usize)> {
         let (world_x, world_y) = self.screen_to_world(screen_x, screen_y);
-        let hit_radius = NEURON_RADIUS / self.zoom.sqrt();
+        let num_layers = self.network.layers.len();
 
         for pos in &self.neuron_positions {
+            // Use larger radius for output layer
+            let is_output = pos.layer_idx == num_layers;
+            let base_radius = if is_output { OUTPUT_NEURON_RADIUS } else { NEURON_RADIUS };
+            let hit_radius = base_radius / self.zoom.sqrt();
+
             let dx = world_x - pos.x;
             let dy = world_y - pos.y;
-            if dx * dx + dy * dy <= (NEURON_RADIUS + hit_radius) * (NEURON_RADIUS + hit_radius) {
+            if dx * dx + dy * dy <= (base_radius + hit_radius) * (base_radius + hit_radius) {
                 return Some((pos.layer_idx, pos.neuron_idx));
             }
         }
@@ -344,7 +351,7 @@ impl State {
 
                 // Stop training if accuracy is good enough or max epochs reached
                 if self.metrics.accuracy >= 0.99 || self.metrics.epoch >= 10 {
-                    self.training_state = TrainingState::Paused;
+                    self.training_state = TrainingState::Completed;
                     break;
                 }
 
@@ -630,7 +637,7 @@ fn train_batches_gpu(state: &mut State, num_batches: usize) {
 
                 // Stop training if accuracy is good enough or max epochs reached
                 if state.metrics.accuracy >= 0.99 || state.metrics.epoch >= 10 {
-                    state.training_state = TrainingState::Paused;
+                    state.training_state = TrainingState::Completed;
                     break;
                 }
 
@@ -942,6 +949,119 @@ fn setup_ui(document: &Document, canvas_width: u32, canvas_height: u32) -> Resul
     )?;
     body.append_child(&tooltip)?;
 
+    // Training Complete Modal
+    let modal_overlay = document.create_element("div")?;
+    modal_overlay.set_id("completion-modal");
+    modal_overlay.set_attribute(
+        "style",
+        "position: fixed; \
+         top: 0; left: 0; right: 0; bottom: 0; \
+         background: rgba(0, 0, 0, 0.7); \
+         display: none; \
+         justify-content: center; \
+         align-items: center; \
+         z-index: 2000;",
+    )?;
+
+    let modal_content = document.create_element("div")?;
+    modal_content.set_attribute(
+        "style",
+        &format!(
+            "background: {}; \
+             border-radius: 16px; \
+             padding: 32px 40px; \
+             text-align: center; \
+             border: 2px solid {}; \
+             box-shadow: 0 20px 60px rgba(0,0,0,0.5); \
+             animation: modalPop 0.3s ease-out;",
+            PANEL_BG, ACCENT_COLOR
+        ),
+    )?;
+
+    // Add CSS animation
+    let style = document.create_element("style")?;
+    style.set_text_content(Some(
+        "@keyframes modalPop { \
+            0% { transform: scale(0.8); opacity: 0; } \
+            100% { transform: scale(1); opacity: 1; } \
+        } \
+        @keyframes confetti { \
+            0% { transform: translateY(0) rotate(0deg); opacity: 1; } \
+            100% { transform: translateY(100px) rotate(720deg); opacity: 0; } \
+        }"
+    ));
+    body.append_child(&style)?;
+
+    let modal_title = document.create_element("div")?;
+    modal_title.set_id("modal-title");
+    modal_title.set_attribute(
+        "style",
+        &format!(
+            "color: {}; font-size: 28px; font-weight: 700; margin-bottom: 8px;",
+            ACCENT_COLOR
+        ),
+    )?;
+    modal_title.set_text_content(Some("🎉 Training Complete!"));
+    modal_content.append_child(&modal_title)?;
+
+    let modal_accuracy = document.create_element("div")?;
+    modal_accuracy.set_id("modal-accuracy");
+    modal_accuracy.set_attribute(
+        "style",
+        &format!(
+            "color: {}; font-size: 48px; font-weight: 800; margin: 16px 0;",
+            TEXT_COLOR
+        ),
+    )?;
+    modal_accuracy.set_text_content(Some("99.0%"));
+    modal_content.append_child(&modal_accuracy)?;
+
+    let modal_subtitle = document.create_element("div")?;
+    modal_subtitle.set_attribute(
+        "style",
+        &format!(
+            "color: {}; font-size: 14px; margin-bottom: 24px;",
+            TEXT_DIM
+        ),
+    )?;
+    modal_subtitle.set_text_content(Some("accuracy achieved"));
+    modal_content.append_child(&modal_subtitle)?;
+
+    let button_container = document.create_element("div")?;
+    button_container.set_attribute("style", "display: flex; gap: 12px; justify-content: center;")?;
+
+    let ok_btn = document.create_element("button")?;
+    ok_btn.set_id("modal-ok-btn");
+    ok_btn.set_text_content(Some("Ok"));
+    ok_btn.set_attribute(
+        "style",
+        &format!(
+            "padding: 12px 32px; font-size: 14px; cursor: pointer; \
+             background: {}; color: {}; border: none; border-radius: 8px; \
+             font-weight: 600; transition: all 0.2s;",
+            ACCENT_COLOR, BG_COLOR
+        ),
+    )?;
+    button_container.append_child(&ok_btn)?;
+
+    let more_btn = document.create_element("button")?;
+    more_btn.set_id("modal-more-btn");
+    more_btn.set_text_content(Some("One...more...epoch"));
+    more_btn.set_attribute(
+        "style",
+        &format!(
+            "padding: 12px 24px; font-size: 14px; cursor: pointer; \
+             background: transparent; color: {}; border: 1px solid {}; border-radius: 8px; \
+             font-weight: 600; transition: all 0.2s;",
+            ACCENT_SECONDARY, ACCENT_SECONDARY
+        ),
+    )?;
+    button_container.append_child(&more_btn)?;
+
+    modal_content.append_child(&button_container)?;
+    modal_overlay.append_child(&modal_content)?;
+    body.append_child(&modal_overlay)?;
+
     Ok(())
 }
 
@@ -1083,6 +1203,10 @@ fn setup_handlers(document: &Document) -> Result<(), JsValue> {
                         s.training_state = TrainingState::Paused;
                         false
                     }
+                    TrainingState::Completed => {
+                        // Do nothing when completed - use modal buttons or reset
+                        false
+                    }
                 }
             } else {
                 false
@@ -1115,6 +1239,7 @@ fn setup_handlers(document: &Document) -> Result<(), JsValue> {
         GPU_NETWORK.with(|gpu| {
             *gpu.borrow_mut() = None;
         });
+        let _ = hide_completion_modal(&doc_clone);
         let _ = update_train_button(&doc_clone);
         let _ = update_gpu_button(&doc_clone);
         let _ = update_metrics(&doc_clone);
@@ -1243,6 +1368,40 @@ fn setup_handlers(document: &Document) -> Result<(), JsValue> {
     digit_canvas.add_event_listener_with_callback("mouseleave", digit_mouseleave_closure.as_ref().unchecked_ref())?;
     digit_mouseleave_closure.forget();
 
+    // Modal "Ok" button - close modal
+    let doc_clone = document.clone();
+    let modal_ok_closure = Closure::wrap(Box::new(move |_event: MouseEvent| {
+        let _ = hide_completion_modal(&doc_clone);
+    }) as Box<dyn Fn(MouseEvent)>);
+    document
+        .get_element_by_id("modal-ok-btn")
+        .ok_or("no modal ok button")?
+        .dyn_into::<HtmlElement>()?
+        .set_onclick(Some(modal_ok_closure.as_ref().unchecked_ref()));
+    modal_ok_closure.forget();
+
+    // Modal "One more epoch" button - close modal and continue training
+    let doc_clone = document.clone();
+    let modal_more_closure = Closure::wrap(Box::new(move |_event: MouseEvent| {
+        let _ = hide_completion_modal(&doc_clone);
+
+        // Set state back to training and continue for one more epoch
+        STATE.with(|state| {
+            if let Some(ref mut s) = *state.borrow_mut() {
+                s.training_state = TrainingState::Training;
+            }
+        });
+
+        let _ = update_train_button(&doc_clone);
+        start_training_loop(doc_clone.clone());
+    }) as Box<dyn Fn(MouseEvent)>);
+    document
+        .get_element_by_id("modal-more-btn")
+        .ok_or("no modal more button")?
+        .dyn_into::<HtmlElement>()?
+        .set_onclick(Some(modal_more_closure.as_ref().unchecked_ref()));
+    modal_more_closure.forget();
+
     Ok(())
 }
 
@@ -1295,7 +1454,7 @@ fn start_training_loop(document: Document) {
     let window = web_sys::window().unwrap();
 
     let closure = Closure::wrap(Box::new(move || {
-        let is_training = STATE.with(|state| {
+        let (is_training, just_completed, final_accuracy) = STATE.with(|state| {
             if let Some(ref mut s) = *state.borrow_mut() {
                 // Poll for async weight sync completion at the START of each frame
                 // This is when the async callbacks will have fired from the previous frame
@@ -1327,30 +1486,39 @@ fn start_training_loop(document: Document) {
 
                     if skip_training {
                         // Skip training this frame to let weight sync complete
-                        true
+                        (true, false, 0.0)
                     } else if use_gpu {
                         #[cfg(feature = "gpu")]
                         {
                             train_batches_gpu(s, BATCHES_PER_FRAME);
                         }
-                        true
+                        // Check if training just completed
+                        let completed = s.training_state == TrainingState::Completed;
+                        (true, completed, s.metrics.accuracy)
                     } else {
                         s.train_batches(BATCHES_PER_FRAME);
-                        true
+                        // Check if training just completed
+                        let completed = s.training_state == TrainingState::Completed;
+                        (true, completed, s.metrics.accuracy)
                     }
                 } else {
-                    false
+                    (false, false, 0.0)
                 }
             } else {
-                false
+                (false, false, 0.0)
             }
         });
 
-        if is_training {
-            let _ = update_metrics(&document);
-            let _ = render_loss_chart(&document);
-            let _ = render(&document);
+        // Update UI
+        let _ = update_metrics(&document);
+        let _ = render_loss_chart(&document);
+        let _ = render(&document);
 
+        if just_completed {
+            // Training just finished - show the completion modal
+            let _ = update_train_button(&document);
+            let _ = show_completion_modal(&document, final_accuracy);
+        } else if is_training {
             // Schedule next frame
             start_training_loop(document.clone());
         }
@@ -1370,6 +1538,7 @@ fn update_train_button(document: &Document) -> Result<(), JsValue> {
                 TrainingState::Idle => ("Start Training", ACCENT_COLOR),
                 TrainingState::Training => ("Pause Training", ACCENT_SECONDARY),
                 TrainingState::Paused => ("Resume Training", ACCENT_COLOR),
+                TrainingState::Completed => ("Training Complete!", "#4a4a5a"),
             };
             btn.set_text_content(Some(text));
             let _ = btn.dyn_ref::<HtmlElement>().unwrap().style().set_property(
@@ -1379,6 +1548,25 @@ fn update_train_button(document: &Document) -> Result<(), JsValue> {
         }
     });
 
+    Ok(())
+}
+
+fn show_completion_modal(document: &Document, accuracy: f32) -> Result<(), JsValue> {
+    let modal = document.get_element_by_id("completion-modal").ok_or("no modal")?;
+    let accuracy_el = document.get_element_by_id("modal-accuracy").ok_or("no modal accuracy")?;
+
+    // Update accuracy display
+    accuracy_el.set_text_content(Some(&format!("{:.1}%", accuracy * 100.0)));
+
+    // Show modal with flex display
+    let _ = modal.dyn_ref::<HtmlElement>().unwrap().style().set_property("display", "flex");
+
+    Ok(())
+}
+
+fn hide_completion_modal(document: &Document) -> Result<(), JsValue> {
+    let modal = document.get_element_by_id("completion-modal").ok_or("no modal")?;
+    let _ = modal.dyn_ref::<HtmlElement>().unwrap().style().set_property("display", "none");
     Ok(())
 }
 
@@ -2010,12 +2198,12 @@ fn render(document: &Document) -> Result<(), JsValue> {
                     );
                 }
             } else if is_output_layer {
-                // Output layer: draw as circles with labels
+                // Output layer: draw as circles with labels (larger for visibility)
 
                 // Draw glow for active neurons
                 if activation > 0.1 {
-                    let glow_alpha = (activation * 0.4).min(0.4) as f64;
-                    let glow_radius = NEURON_RADIUS * (1.5 + activation as f64 * 0.5);
+                    let glow_alpha = (activation * 0.5).min(0.5) as f64;
+                    let glow_radius = OUTPUT_NEURON_RADIUS * (1.3 + activation as f64 * 0.4);
 
                     ctx.begin_path();
                     let _ = ctx.arc(pos.x, pos.y, glow_radius, 0.0, std::f64::consts::TAU);
@@ -2025,26 +2213,26 @@ fn render(document: &Document) -> Result<(), JsValue> {
                     ctx.set_global_alpha(1.0);
                 }
 
-                // Neuron circle
+                // Neuron circle (larger for output layer)
                 ctx.begin_path();
-                let _ = ctx.arc(pos.x, pos.y, NEURON_RADIUS, 0.0, std::f64::consts::TAU);
+                let _ = ctx.arc(pos.x, pos.y, OUTPUT_NEURON_RADIUS, 0.0, std::f64::consts::TAU);
 
                 if is_hovered {
                     ctx.set_fill_style_str(NEURON_HOVER);
                     ctx.set_stroke_style_str("#ffffff");
-                    ctx.set_line_width(2.5 / state.zoom);
+                    ctx.set_line_width(3.0 / state.zoom);
                 } else {
                     ctx.set_fill_style_str(&fill_color);
                     ctx.set_stroke_style_str(NEURON_STROKE);
-                    ctx.set_line_width(1.5 / state.zoom);
+                    ctx.set_line_width(2.0 / state.zoom);
                 }
 
                 ctx.fill();
                 ctx.stroke();
 
-                // Draw output layer labels
+                // Draw output layer labels (larger font)
                 ctx.set_fill_style_str(TEXT_COLOR);
-                ctx.set_font(&format!("{}px 'Inter', sans-serif", (10.0 / state.zoom.sqrt()).max(8.0)));
+                ctx.set_font(&format!("bold {}px 'Inter', sans-serif", (16.0 / state.zoom.sqrt()).max(12.0)));
                 ctx.set_text_align("center");
                 ctx.set_text_baseline("middle");
                 let _ = ctx.fill_text(&pos.neuron_idx.to_string(), pos.x, pos.y);
