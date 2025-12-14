@@ -1,0 +1,52 @@
+[package]
+name = "lm-viz"
+version = "0.1.0"
+edition = "2024"
+description = "Language model training visualization with WASM support"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+transformer = { path = "../libs/transformer" }
+tokenizer = { path = "../libs/tokenizer" }
+# wiki-fetch removed for WASM - training data can be embedded or fetched via JS
+common = { path = "../libs/common" }
+wasm-bindgen = "0.2"
+rand = "0.9"
+getrandom = { version = "0.3", features = ["wasm_js"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+web-sys = { version = "0.3", features = [
+    "Document",
+    "Element",
+    "HtmlElement",
+    "HtmlCanvasElement",
+    "CanvasRenderingContext2d",
+    "CssStyleDeclaration",
+    "Window",
+    "Node",
+    "MouseEvent",
+    "KeyboardEvent",
+    "HtmlInputElement",
+    "HtmlTextAreaElement",
+    "HtmlButtonElement",
+    "HtmlDivElement",
+    "Navigator",
+    "console",
+    "Performance",
+    # For model save/load
+    "Blob",
+    "BlobPropertyBag",
+    "Url",
+    "FileReader",
+    "FileList",
+    "File",
+    "Event",
+    "EventTarget",
+]}
+js-sys = "0.3"
+wasm-bindgen-futures = "0.4"
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
