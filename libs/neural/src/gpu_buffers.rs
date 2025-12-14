@@ -138,10 +138,16 @@ impl GpuLayerBuffers {
     }
 }
 
+/// Number of input buffers in the pool for batched submissions
+/// Higher = fewer GPU submissions but more memory usage
+#[cfg(feature = "gpu")]
+pub const INPUT_BUFFER_POOL_SIZE: usize = 32;
+
 /// All GPU buffers for a complete network
 #[cfg(feature = "gpu")]
 pub struct GpuNetworkBuffers {
-    pub input: GpuBuffer,        // Input buffer for the network
+    pub input: GpuBuffer,        // Single input buffer (legacy, for non-batched use)
+    pub input_pool: Vec<GpuBuffer>,  // Pool of input buffers for batched submissions
     pub layers: Vec<GpuLayerBuffers>,
     pub staging_buffer: wgpu::Buffer,  // For async readback
     staging_size: usize,
@@ -165,6 +171,11 @@ impl GpuNetworkBuffers {
         }
 
         let input = GpuBuffer::new(device, input_size, "network_input");
+
+        // Create input buffer pool for batched submissions
+        let input_pool: Vec<GpuBuffer> = (0..INPUT_BUFFER_POOL_SIZE)
+            .map(|i| GpuBuffer::new(device, input_size, &format!("input_pool_{}", i)))
+            .collect();
 
         let layers: Vec<GpuLayerBuffers> = network.layers
             .iter()
@@ -193,10 +204,21 @@ impl GpuNetworkBuffers {
 
         GpuNetworkBuffers {
             input,
+            input_pool,
             layers,
             staging_buffer,
             staging_size: max_size,
         }
+    }
+
+    /// Upload input data to a specific buffer in the pool
+    pub fn upload_input_pooled(&self, queue: &wgpu::Queue, pool_index: usize, data: &[f32]) {
+        self.input_pool[pool_index].write(queue, data);
+    }
+
+    /// Get the number of input buffers in the pool
+    pub fn pool_size(&self) -> usize {
+        self.input_pool.len()
     }
 
     /// Upload input data to GPU
