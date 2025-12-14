@@ -43,7 +43,7 @@ enum TrainingState {
     Completed,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum AcceleratorMode {
     Cpu,
     Gpu,
@@ -210,7 +210,7 @@ impl State {
             current_batch_idx: 0,
             current_activations: vec![Vec::new(); num_layers],
             current_prediction: None,
-            accelerator_mode: AcceleratorMode::Cpu, // Default to CPU
+            accelerator_mode: get_default_accelerator_mode(gpu_available),
             gpu_available,
             gpu_init_state: GpuInitState::NotStarted,
             drawing_mode: false,
@@ -707,6 +707,11 @@ pub fn init(csv_data: &[u8]) -> Result<(), JsValue> {
     render_digit(&document)?;
     render(&document)?;
 
+    // Auto-initialize GPU if available and GPU mode is default
+    if gpu_available {
+        init_gpu_async(document.clone());
+    }
+
     Ok(())
 }
 
@@ -760,13 +765,14 @@ fn init_gpu_async(document: Document) {
                     web_sys::console::log_1(&"GPU network initialized successfully".into());
                 }
                 Err(e) => {
-                    // Mark as failed
+                    // Mark as failed and auto-fallback to CPU
                     STATE.with(|state| {
                         if let Some(ref mut s) = *state.borrow_mut() {
                             s.gpu_init_state = GpuInitState::Failed;
+                            s.accelerator_mode = AcceleratorMode::Cpu;
                         }
                     });
-                    web_sys::console::error_1(&format!("GPU initialization failed: {}", e).into());
+                    web_sys::console::error_1(&format!("GPU initialization failed, falling back to CPU: {}", e).into());
                 }
             }
         }
@@ -1027,20 +1033,44 @@ fn setup_ui(document: &Document, canvas_width: u32, canvas_height: u32) -> Resul
     )?;
     controls_section.append_child(&reset_btn)?;
 
-    // GPU Toggle Button
+    // GPU/CPU toggle buttons container
+    let accel_container = document.create_element("div")?;
+    accel_container.set_attribute(
+        "style",
+        "display: flex; gap: 4px;",
+    )?;
+
+    // GPU button (on left, default when available)
     let gpu_btn = document.create_element("button")?;
     gpu_btn.set_id("gpu-btn");
-    gpu_btn.set_text_content(Some("CPU Mode"));
+    gpu_btn.set_text_content(Some("GPU"));
     gpu_btn.set_attribute(
         "style",
         &format!(
-            "width: 100%; padding: 8px; font-size: 12px; cursor: pointer; \
-             background: #1a2a3a; color: {}; border: 1px solid {}; border-radius: 6px; \
-             transition: all 0.2s;",
+            "flex: 1; padding: 6px 4px; font-size: 11px; cursor: pointer; \
+             background: #1a2a3a; color: {}; border: 1px solid {}; border-radius: 4px; \
+             font-weight: 500; transition: all 0.2s;",
             TEXT_COLOR, NEURON_STROKE
         ),
     )?;
-    controls_section.append_child(&gpu_btn)?;
+    accel_container.append_child(&gpu_btn)?;
+
+    // CPU button (on right)
+    let cpu_btn = document.create_element("button")?;
+    cpu_btn.set_id("cpu-btn");
+    cpu_btn.set_text_content(Some("CPU"));
+    cpu_btn.set_attribute(
+        "style",
+        &format!(
+            "flex: 1; padding: 6px 4px; font-size: 11px; cursor: pointer; \
+             background: #1a2a3a; color: {}; border: 1px solid {}; border-radius: 4px; \
+             font-weight: 500; transition: all 0.2s;",
+            TEXT_COLOR, NEURON_STROKE
+        ),
+    )?;
+    accel_container.append_child(&cpu_btn)?;
+
+    controls_section.append_child(&accel_container)?;
 
     // GPU Status indicator
     let gpu_status = document.create_element("div")?;
@@ -1048,7 +1078,7 @@ fn setup_ui(document: &Document, canvas_width: u32, canvas_height: u32) -> Resul
     gpu_status.set_attribute(
         "style",
         &format!(
-            "color: {}; font-size: 11px; text-align: center; padding: 4px;",
+            "color: {}; font-size: 10px; text-align: center; padding: 2px;",
             TEXT_DIM
         ),
     )?;
@@ -1165,9 +1195,9 @@ fn setup_ui(document: &Document, canvas_width: u32, canvas_height: u32) -> Resul
         "style",
         &format!(
             "width: 100%; padding: 8px; font-size: 12px; cursor: pointer; \
-             background: transparent; color: {}; border: 1px solid {}; border-radius: 6px; \
+             background: #1a2a3a; color: {}; border: 1px solid {}; border-radius: 6px; \
              transition: all 0.2s;",
-            NEURON_STROKE, NEURON_STROKE
+            TEXT_COLOR, NEURON_STROKE
         ),
     )?;
     left_panel.append_child(&load_btn)?;
@@ -1180,9 +1210,9 @@ fn setup_ui(document: &Document, canvas_width: u32, canvas_height: u32) -> Resul
         "style",
         &format!(
             "width: 100%; padding: 8px; font-size: 12px; cursor: pointer; \
-             background: transparent; color: {}; border: 1px solid {}; border-radius: 6px; \
+             background: #1a2a3a; color: {}; border: 1px solid {}; border-radius: 6px; \
              transition: all 0.2s;",
-            ACCENT_SECONDARY, ACCENT_SECONDARY
+            TEXT_COLOR, NEURON_STROKE
         ),
     )?;
     left_panel.append_child(&draw_btn)?;
@@ -1778,6 +1808,15 @@ fn setup_handlers(document: &Document) -> Result<(), JsValue> {
     // Reset button
     let doc_clone = document.clone();
     let reset_closure = Closure::wrap(Box::new(move |_event: MouseEvent| {
+        // Get GPU availability before reset
+        let (gpu_available, accel_mode) = STATE.with(|state| {
+            if let Some(ref s) = *state.borrow() {
+                (s.gpu_available, s.accelerator_mode)
+            } else {
+                (false, AcceleratorMode::Cpu)
+            }
+        });
+
         STATE.with(|state| {
             if let Some(ref mut s) = *state.borrow_mut() {
                 s.reset_network();
@@ -1793,6 +1832,11 @@ fn setup_handlers(document: &Document) -> Result<(), JsValue> {
         let _ = update_metrics(&doc_clone);
         let _ = render_loss_chart(&doc_clone);
         let _ = render(&doc_clone);
+
+        // Re-initialize GPU if it was available and in GPU mode
+        if gpu_available && accel_mode == AcceleratorMode::Gpu {
+            init_gpu_async(doc_clone.clone());
+        }
     }) as Box<dyn Fn(MouseEvent)>);
     document
         .get_element_by_id("reset-btn")
@@ -1855,14 +1899,14 @@ fn setup_handlers(document: &Document) -> Result<(), JsValue> {
         .set_onclick(Some(loglog_closure.as_ref().unchecked_ref()));
     loglog_closure.forget();
 
-    // GPU toggle button
+    // GPU button click handler
     let doc_clone = document.clone();
     let gpu_closure = Closure::wrap(Box::new(move |_event: MouseEvent| {
-        let (is_training, current_mode, gpu_available, gpu_init_state) = STATE.with(|state| {
+        let (is_training, gpu_available, gpu_init_state) = STATE.with(|state| {
             if let Some(ref s) = *state.borrow() {
-                (s.training_state == TrainingState::Training, s.accelerator_mode, s.gpu_available, s.gpu_init_state)
+                (s.training_state == TrainingState::Training, s.gpu_available, s.gpu_init_state)
             } else {
-                (false, AcceleratorMode::Cpu, false, GpuInitState::NotStarted)
+                (false, false, GpuInitState::NotStarted)
             }
         });
 
@@ -1871,21 +1915,18 @@ fn setup_handlers(document: &Document) -> Result<(), JsValue> {
             return;
         }
 
-        // Toggle mode
-        let new_mode = match current_mode {
-            AcceleratorMode::Cpu => AcceleratorMode::Gpu,
-            AcceleratorMode::Gpu => AcceleratorMode::Cpu,
-        };
+        // Don't allow selecting GPU if not available or init failed
+        if !gpu_available || gpu_init_state == GpuInitState::Failed {
+            return;
+        }
 
-        STATE.with(|state| {
-            if let Some(ref mut s) = *state.borrow_mut() {
-                s.accelerator_mode = new_mode;
-            }
-        });
-
-        // If switching to GPU and not initialized yet, start async initialization
-        if new_mode == AcceleratorMode::Gpu && gpu_available && gpu_init_state == GpuInitState::NotStarted {
-            init_gpu_async(doc_clone.clone());
+        // Only allow GPU if ready (init happens automatically on startup)
+        if gpu_init_state == GpuInitState::Ready {
+            STATE.with(|state| {
+                if let Some(ref mut s) = *state.borrow_mut() {
+                    s.accelerator_mode = AcceleratorMode::Gpu;
+                }
+            });
         }
 
         let _ = update_gpu_button(&doc_clone);
@@ -1896,6 +1937,37 @@ fn setup_handlers(document: &Document) -> Result<(), JsValue> {
         .dyn_into::<HtmlElement>()?
         .set_onclick(Some(gpu_closure.as_ref().unchecked_ref()));
     gpu_closure.forget();
+
+    // CPU button click handler
+    let doc_clone = document.clone();
+    let cpu_closure = Closure::wrap(Box::new(move |_event: MouseEvent| {
+        let is_training = STATE.with(|state| {
+            if let Some(ref s) = *state.borrow() {
+                s.training_state == TrainingState::Training
+            } else {
+                false
+            }
+        });
+
+        // Don't allow switching while training
+        if is_training {
+            return;
+        }
+
+        STATE.with(|state| {
+            if let Some(ref mut s) = *state.borrow_mut() {
+                s.accelerator_mode = AcceleratorMode::Cpu;
+            }
+        });
+
+        let _ = update_gpu_button(&doc_clone);
+    }) as Box<dyn Fn(MouseEvent)>);
+    document
+        .get_element_by_id("cpu-btn")
+        .ok_or("no cpu button")?
+        .dyn_into::<HtmlElement>()?
+        .set_onclick(Some(cpu_closure.as_ref().unchecked_ref()));
+    cpu_closure.forget();
 
     // Initialize GPU button state
     update_gpu_button(document)?;
@@ -1912,10 +1984,10 @@ fn setup_handlers(document: &Document) -> Result<(), JsValue> {
         let x = event.offset_x() as f64;
         let y = event.offset_y() as f64;
 
-        // Convert canvas coords (140x140) to pixel index (28x28)
-        // Each pixel is displayed at 5x scale
-        let col = (x / 5.0).floor() as usize;
-        let row = (y / 5.0).floor() as usize;
+        // Convert canvas coords (120x120) to pixel index (28x28)
+        let scale = 120.0 / 28.0;
+        let col = (x / scale).floor() as usize;
+        let row = (y / scale).floor() as usize;
 
         if col < 28 && row < 28 {
             let pixel_idx = row * 28 + col;
@@ -2181,43 +2253,84 @@ fn update_scale_buttons(document: &Document) -> Result<(), JsValue> {
 }
 
 fn update_gpu_button(document: &Document) -> Result<(), JsValue> {
-    let btn = document.get_element_by_id("gpu-btn").ok_or("no gpu button")?;
+    let gpu_btn = document.get_element_by_id("gpu-btn").ok_or("no gpu button")?;
+    let cpu_btn = document.get_element_by_id("cpu-btn").ok_or("no cpu button")?;
     let status = document.get_element_by_id("gpu-status").ok_or("no gpu status")?;
 
     STATE.with(|state| {
         let state = state.borrow();
         if let Some(ref s) = *state {
-            let (text, bg_color, border_color) = match s.accelerator_mode {
-                AcceleratorMode::Cpu => ("CPU Mode", "#1a2a3a", NEURON_STROKE),
+            let gpu_btn_el = gpu_btn.dyn_ref::<HtmlElement>().unwrap();
+            let cpu_btn_el = cpu_btn.dyn_ref::<HtmlElement>().unwrap();
+
+            // Check if GPU is usable (available and not failed)
+            let gpu_usable = s.gpu_available && s.gpu_init_state != GpuInitState::Failed;
+
+            // Style buttons based on current mode and GPU availability
+            match s.accelerator_mode {
                 AcceleratorMode::Gpu => {
-                    match s.gpu_init_state {
-                        GpuInitState::NotStarted => ("GPU Mode", "#1a3a4a", NEURON_STROKE),
-                        GpuInitState::Initializing => ("GPU Init...", "#2a3a4a", "#f0ad4e"),
-                        GpuInitState::Ready => ("GPU Mode", "#1a4a3a", ACCENT_COLOR),
-                        GpuInitState::Failed => ("GPU Mode", "#4a2a2a", ACCENT_SECONDARY),
+                    // GPU is active
+                    let gpu_bg = match s.gpu_init_state {
+                        GpuInitState::NotStarted => ACCENT_COLOR,
+                        GpuInitState::Initializing => "#f0ad4e",
+                        GpuInitState::Ready => ACCENT_COLOR,
+                        GpuInitState::Failed => ACCENT_SECONDARY,
+                    };
+                    let _ = gpu_btn_el.style().set_property("background", gpu_bg);
+                    let _ = gpu_btn_el.style().set_property("border", "none");
+                    let _ = gpu_btn_el.style().set_property("color", BG_COLOR);
+                    let _ = gpu_btn_el.style().set_property("font-weight", "600");
+                    let _ = gpu_btn_el.style().set_property("opacity", "1");
+                    let _ = gpu_btn_el.style().set_property("cursor", "pointer");
+
+                    // CPU is inactive
+                    let _ = cpu_btn_el.style().set_property("background", "#1a2a3a");
+                    let _ = cpu_btn_el.style().set_property("border", &format!("1px solid {}", NEURON_STROKE));
+                    let _ = cpu_btn_el.style().set_property("color", TEXT_COLOR);
+                    let _ = cpu_btn_el.style().set_property("font-weight", "500");
+                }
+                AcceleratorMode::Cpu => {
+                    // CPU is active
+                    let _ = cpu_btn_el.style().set_property("background", ACCENT_COLOR);
+                    let _ = cpu_btn_el.style().set_property("border", "none");
+                    let _ = cpu_btn_el.style().set_property("color", BG_COLOR);
+                    let _ = cpu_btn_el.style().set_property("font-weight", "600");
+
+                    // GPU button - disabled style if not usable
+                    if gpu_usable {
+                        let _ = gpu_btn_el.style().set_property("background", "#1a2a3a");
+                        let _ = gpu_btn_el.style().set_property("border", &format!("1px solid {}", NEURON_STROKE));
+                        let _ = gpu_btn_el.style().set_property("color", TEXT_COLOR);
+                        let _ = gpu_btn_el.style().set_property("font-weight", "500");
+                        let _ = gpu_btn_el.style().set_property("opacity", "1");
+                        let _ = gpu_btn_el.style().set_property("cursor", "pointer");
+                    } else {
+                        // Disabled style - grayed out
+                        let _ = gpu_btn_el.style().set_property("background", "#1a1a2a");
+                        let _ = gpu_btn_el.style().set_property("border", "1px solid #2a2a3a");
+                        let _ = gpu_btn_el.style().set_property("color", "#4a4a5a");
+                        let _ = gpu_btn_el.style().set_property("font-weight", "500");
+                        let _ = gpu_btn_el.style().set_property("opacity", "0.5");
+                        let _ = gpu_btn_el.style().set_property("cursor", "not-allowed");
                     }
                 }
             };
 
-            btn.set_text_content(Some(text));
-            let btn_el = btn.dyn_ref::<HtmlElement>().unwrap();
-            let _ = btn_el.style().set_property("background", bg_color);
-            let _ = btn_el.style().set_property("border-color", border_color);
-
-            // Update status text based on mode and GPU state
-            let (status_text, status_color) = match s.accelerator_mode {
-                AcceleratorMode::Cpu => ("Training on CPU".to_string(), TEXT_DIM),
-                AcceleratorMode::Gpu => {
-                    if !s.gpu_available {
-                        ("WebGPU not available".to_string(), ACCENT_SECONDARY)
-                    } else {
-                        match s.gpu_init_state {
-                            GpuInitState::NotStarted => ("Click to initialize GPU".to_string(), TEXT_DIM),
-                            GpuInitState::Initializing => ("Initializing WebGPU...".to_string(), "#f0ad4e"),
-                            GpuInitState::Ready => ("WebGPU ready".to_string(), ACCENT_COLOR),
-                            GpuInitState::Failed => ("GPU init failed".to_string(), ACCENT_SECONDARY),
+            // Update status text based on GPU state
+            let (status_text, status_color) = if !s.gpu_available {
+                ("WebGPU unavailable".to_string(), ACCENT_SECONDARY)
+            } else {
+                match s.gpu_init_state {
+                    GpuInitState::NotStarted => ("Initializing GPU...".to_string(), TEXT_DIM),
+                    GpuInitState::Initializing => ("Initializing GPU...".to_string(), "#f0ad4e"),
+                    GpuInitState::Ready => {
+                        if s.accelerator_mode == AcceleratorMode::Gpu {
+                            ("WebGPU active".to_string(), ACCENT_COLOR)
+                        } else {
+                            ("WebGPU ready".to_string(), TEXT_DIM)
                         }
                     }
+                    GpuInitState::Failed => ("GPU failed, using CPU".to_string(), ACCENT_SECONDARY),
                 }
             };
             status.set_text_content(Some(&status_text));
@@ -2909,4 +3022,30 @@ fn render(document: &Document) -> Result<(), JsValue> {
 
         Ok(())
     })
+}
+
+/// Returns the default accelerator mode based on GPU availability
+fn get_default_accelerator_mode(gpu_available: bool) -> AcceleratorMode {
+    if gpu_available {
+        AcceleratorMode::Gpu
+    } else {
+        AcceleratorMode::Cpu
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_accelerator_gpu_when_available() {
+        let mode = get_default_accelerator_mode(true);
+        assert_eq!(mode, AcceleratorMode::Gpu, "GPU should be default when available");
+    }
+
+    #[test]
+    fn test_default_accelerator_cpu_when_gpu_unavailable() {
+        let mode = get_default_accelerator_mode(false);
+        assert_eq!(mode, AcceleratorMode::Cpu, "CPU should be default when GPU unavailable");
+    }
 }
