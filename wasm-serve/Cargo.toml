@@ -1,0 +1,17 @@
+[package]
+name = "wasm-serve"
+version = "0.1.0"
+edition = "2024"
+description = "A simple HTTP server for serving WASM applications"
+
+[[bin]]
+name = "wasm-serve"
+path = "src/main.rs"
+
+[dependencies]
+tiny_http = "0.12"
+clap = { version = "4", features = ["derive"] }
+mime_guess = "2"
+
+[dev-dependencies]
+tempfile = "3"

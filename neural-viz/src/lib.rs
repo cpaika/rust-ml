@@ -1,4 +1,6 @@
 mod viz;
+#[cfg(test)]
+mod gpu_training_tests;
 
 use wasm_bindgen::prelude::*;
 

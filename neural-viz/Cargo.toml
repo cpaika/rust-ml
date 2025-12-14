@@ -10,6 +10,8 @@ crate-type = ["cdylib", "rlib"]
 neural = { path = "../libs/neural" }
 common = { path = "../libs/common" }
 wasm-bindgen = "0.2"
+rand = "0.8"
+getrandom = { version = "0.2", features = ["js"] }
 web-sys = { version = "0.3", features = [
     "Document",
     "Element",
@@ -22,7 +24,14 @@ web-sys = { version = "0.3", features = [
     "MouseEvent",
     "WheelEvent",
     "HtmlButtonElement",
+    "Navigator",
+    "console",
 ]}
+js-sys = "0.3"
+# GPU dependencies (always included)
+wgpu = { version = "23", features = ["webgpu"] }
+wasm-bindgen-futures = "0.4"
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
+pollster = "0.4"
