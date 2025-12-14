@@ -57,6 +57,13 @@ enum GpuInitState {
     Failed,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum ChartScale {
+    Linear,
+    Log,
+    LogLog,
+}
+
 struct TrainingMetrics {
     epoch: usize,
     batch: usize,
@@ -65,7 +72,10 @@ struct TrainingMetrics {
     loss: f32,
     accuracy: f32,
     loss_history: Vec<f32>,
-    log_scale: bool,
+    chart_scale: ChartScale,
+    // Timing for FLOPS calculation
+    training_start_time: Option<f64>,
+    flops_per_sample: usize,
 }
 
 impl Default for TrainingMetrics {
@@ -78,9 +88,39 @@ impl Default for TrainingMetrics {
             loss: 0.0,
             accuracy: 0.0,
             loss_history: Vec::new(),
-            log_scale: false,
+            chart_scale: ChartScale::Linear,
+            training_start_time: None,
+            flops_per_sample: 0,
         }
     }
+}
+
+/// Calculate FLOPs per sample for a neural network
+/// For each layer: forward + backward pass
+fn calculate_flops_per_sample(layer_sizes: &[usize]) -> usize {
+    let mut total_flops = 0;
+
+    for i in 0..layer_sizes.len() - 1 {
+        let input_size = layer_sizes[i];
+        let output_size = layer_sizes[i + 1];
+
+        // Forward pass:
+        // - Matrix multiply: 2 * in * out (multiply + add)
+        // - Bias addition: out
+        // - Activation: out (ReLU comparison or softmax)
+        let forward = 2 * input_size * output_size + 2 * output_size;
+
+        // Backward pass (roughly 3x forward):
+        // - Error backprop: 2 * in * out
+        // - Weight gradients: 2 * in * out
+        // - Weight updates: 2 * in * out
+        // - Bias updates: 2 * out
+        let backward = 6 * input_size * output_size + 2 * output_size;
+
+        total_flops += forward + backward;
+    }
+
+    total_flops
 }
 
 struct State {
@@ -140,6 +180,12 @@ impl State {
         // Only create training samples from training data
         let samples: Vec<MnistSample> = train_digits.iter().map(|d| MnistSample::new(d.clone())).collect();
 
+        // Calculate FLOPs per sample for this network architecture
+        let flops_per_sample = calculate_flops_per_sample(&network.layer_sizes());
+
+        let mut metrics = TrainingMetrics::default();
+        metrics.flops_per_sample = flops_per_sample;
+
         Self {
             network,
             train_digits,
@@ -160,7 +206,7 @@ impl State {
             drag_start_x: 0.0,
             drag_start_y: 0.0,
             training_state: TrainingState::Idle,
-            metrics: TrainingMetrics::default(),
+            metrics,
             current_batch_idx: 0,
             current_activations: vec![Vec::new(); num_layers],
             current_prediction: None,
@@ -543,7 +589,10 @@ impl State {
     fn reset_network(&mut self) {
         self.network = Network::mnist_default();
         self.training_state = TrainingState::Idle;
+        // Reset metrics but preserve flops_per_sample (network architecture unchanged)
+        let flops_per_sample = self.metrics.flops_per_sample;
         self.metrics = TrainingMetrics::default();
+        self.metrics.flops_per_sample = flops_per_sample;
         self.current_batch_idx = 0;
         self.current_activations.clear();
         self.current_prediction = None;
@@ -1022,8 +1071,9 @@ fn setup_ui(document: &Document, canvas_width: u32, canvas_height: u32) -> Resul
          <div id='metric-epoch' style='color: {}; font-size: 13px; margin-bottom: 4px;'>Epoch: 0</div>\
          <div id='metric-batch' style='color: {}; font-size: 13px; margin-bottom: 4px;'>Batch: 0/0</div>\
          <div id='metric-loss' style='color: {}; font-size: 13px; margin-bottom: 4px;'>Loss: -</div>\
-         <div id='metric-accuracy' style='color: {}; font-size: 13px;'>Accuracy: -</div>",
-        TEXT_DIM, TEXT_COLOR, TEXT_COLOR, TEXT_COLOR, TEXT_COLOR
+         <div id='metric-accuracy' style='color: {}; font-size: 13px; margin-bottom: 4px;'>Accuracy: -</div>\
+         <div id='metric-flops' style='color: {}; font-size: 13px;'>FLOPS: -</div>",
+        TEXT_DIM, TEXT_COLOR, TEXT_COLOR, TEXT_COLOR, TEXT_COLOR, TEXT_COLOR
     ));
     left_panel.append_child(&metrics_section)?;
 
@@ -1038,20 +1088,59 @@ fn setup_ui(document: &Document, canvas_width: u32, canvas_height: u32) -> Resul
     )?;
     left_panel.append_child(&chart_canvas)?;
 
-    // Scale toggle button
-    let scale_btn = document.create_element("button")?;
-    scale_btn.set_id("scale-btn");
-    scale_btn.set_text_content(Some("Linear Scale"));
-    scale_btn.set_attribute(
+    // Scale buttons container
+    let scale_container = document.create_element("div")?;
+    scale_container.set_attribute(
+        "style",
+        "display: flex; gap: 4px; margin-top: 6px;",
+    )?;
+
+    // Linear scale button
+    let linear_btn = document.create_element("button")?;
+    linear_btn.set_id("scale-linear-btn");
+    linear_btn.set_text_content(Some("Linear"));
+    linear_btn.set_attribute(
         "style",
         &format!(
-            "width: 100%; padding: 8px; font-size: 12px; cursor: pointer; \
-             background: #1a2a3a; color: {}; border: 1px solid {}; border-radius: 6px; \
-             margin-top: 6px; font-weight: 500; transition: all 0.2s;",
+            "flex: 1; padding: 6px 4px; font-size: 11px; cursor: pointer; \
+             background: {}; color: {}; border: none; border-radius: 4px; \
+             font-weight: 600; transition: all 0.2s;",
+            ACCENT_COLOR, BG_COLOR
+        ),
+    )?;
+    scale_container.append_child(&linear_btn)?;
+
+    // Log scale button
+    let log_btn = document.create_element("button")?;
+    log_btn.set_id("scale-log-btn");
+    log_btn.set_text_content(Some("Log"));
+    log_btn.set_attribute(
+        "style",
+        &format!(
+            "flex: 1; padding: 6px 4px; font-size: 11px; cursor: pointer; \
+             background: #1a2a3a; color: {}; border: 1px solid {}; border-radius: 4px; \
+             font-weight: 500; transition: all 0.2s;",
             TEXT_COLOR, NEURON_STROKE
         ),
     )?;
-    left_panel.append_child(&scale_btn)?;
+    scale_container.append_child(&log_btn)?;
+
+    // Log-Log scale button
+    let loglog_btn = document.create_element("button")?;
+    loglog_btn.set_id("scale-loglog-btn");
+    loglog_btn.set_text_content(Some("Log-Log"));
+    loglog_btn.set_attribute(
+        "style",
+        &format!(
+            "flex: 1; padding: 6px 4px; font-size: 11px; cursor: pointer; \
+             background: #1a2a3a; color: {}; border: 1px solid {}; border-radius: 4px; \
+             font-weight: 500; transition: all 0.2s;",
+            TEXT_COLOR, NEURON_STROKE
+        ),
+    )?;
+    scale_container.append_child(&loglog_btn)?;
+
+    left_panel.append_child(&scale_container)?;
 
     // Divider
     let divider = document.create_element("div")?;
@@ -1652,6 +1741,10 @@ fn setup_handlers(document: &Document) -> Result<(), JsValue> {
                 match s.training_state {
                     TrainingState::Idle | TrainingState::Paused => {
                         s.training_state = TrainingState::Training;
+                        // Start timing if this is the first start (Idle)
+                        if s.metrics.training_start_time.is_none() {
+                            s.metrics.training_start_time = Some(js_sys::Date::now());
+                        }
                         true
                     }
                     TrainingState::Training => {
@@ -1707,23 +1800,59 @@ fn setup_handlers(document: &Document) -> Result<(), JsValue> {
         .set_onclick(Some(reset_closure.as_ref().unchecked_ref()));
     reset_closure.forget();
 
-    // Scale toggle button
+    // Linear scale button
     let doc_clone = document.clone();
-    let scale_closure = Closure::wrap(Box::new(move |_event: MouseEvent| {
+    let linear_closure = Closure::wrap(Box::new(move |_event: MouseEvent| {
         STATE.with(|state| {
             if let Some(ref mut s) = *state.borrow_mut() {
-                s.metrics.log_scale = !s.metrics.log_scale;
+                s.metrics.chart_scale = ChartScale::Linear;
             }
         });
-        let _ = update_scale_button(&doc_clone);
+        let _ = update_scale_buttons(&doc_clone);
         let _ = render_loss_chart(&doc_clone);
     }) as Box<dyn Fn(MouseEvent)>);
     document
-        .get_element_by_id("scale-btn")
-        .ok_or("no scale button")?
+        .get_element_by_id("scale-linear-btn")
+        .ok_or("no linear scale button")?
         .dyn_into::<HtmlElement>()?
-        .set_onclick(Some(scale_closure.as_ref().unchecked_ref()));
-    scale_closure.forget();
+        .set_onclick(Some(linear_closure.as_ref().unchecked_ref()));
+    linear_closure.forget();
+
+    // Log scale button
+    let doc_clone = document.clone();
+    let log_closure = Closure::wrap(Box::new(move |_event: MouseEvent| {
+        STATE.with(|state| {
+            if let Some(ref mut s) = *state.borrow_mut() {
+                s.metrics.chart_scale = ChartScale::Log;
+            }
+        });
+        let _ = update_scale_buttons(&doc_clone);
+        let _ = render_loss_chart(&doc_clone);
+    }) as Box<dyn Fn(MouseEvent)>);
+    document
+        .get_element_by_id("scale-log-btn")
+        .ok_or("no log scale button")?
+        .dyn_into::<HtmlElement>()?
+        .set_onclick(Some(log_closure.as_ref().unchecked_ref()));
+    log_closure.forget();
+
+    // Log-Log scale button
+    let doc_clone = document.clone();
+    let loglog_closure = Closure::wrap(Box::new(move |_event: MouseEvent| {
+        STATE.with(|state| {
+            if let Some(ref mut s) = *state.borrow_mut() {
+                s.metrics.chart_scale = ChartScale::LogLog;
+            }
+        });
+        let _ = update_scale_buttons(&doc_clone);
+        let _ = render_loss_chart(&doc_clone);
+    }) as Box<dyn Fn(MouseEvent)>);
+    document
+        .get_element_by_id("scale-loglog-btn")
+        .ok_or("no log-log scale button")?
+        .dyn_into::<HtmlElement>()?
+        .set_onclick(Some(loglog_closure.as_ref().unchecked_ref()));
+    loglog_closure.forget();
 
     // GPU toggle button
     let doc_clone = document.clone();
@@ -2014,14 +2143,36 @@ fn hide_completion_modal(document: &Document) -> Result<(), JsValue> {
     Ok(())
 }
 
-fn update_scale_button(document: &Document) -> Result<(), JsValue> {
-    let btn = document.get_element_by_id("scale-btn").ok_or("no scale button")?;
+fn update_scale_buttons(document: &Document) -> Result<(), JsValue> {
+    let linear_btn = document.get_element_by_id("scale-linear-btn").ok_or("no linear btn")?;
+    let log_btn = document.get_element_by_id("scale-log-btn").ok_or("no log btn")?;
+    let loglog_btn = document.get_element_by_id("scale-loglog-btn").ok_or("no loglog btn")?;
 
     STATE.with(|state| {
         let state = state.borrow();
         if let Some(ref s) = *state {
-            let text = if s.metrics.log_scale { "Log Scale" } else { "Linear Scale" };
-            btn.set_text_content(Some(text));
+            let active_style = format!(
+                "flex: 1; padding: 6px 4px; font-size: 11px; cursor: pointer; \
+                 background: {}; color: {}; border: none; border-radius: 4px; \
+                 font-weight: 600; transition: all 0.2s;",
+                ACCENT_COLOR, BG_COLOR
+            );
+            let inactive_style = format!(
+                "flex: 1; padding: 6px 4px; font-size: 11px; cursor: pointer; \
+                 background: #1a2a3a; color: {}; border: 1px solid {}; border-radius: 4px; \
+                 font-weight: 500; transition: all 0.2s;",
+                TEXT_COLOR, NEURON_STROKE
+            );
+
+            let (linear_style, log_style, loglog_style) = match s.metrics.chart_scale {
+                ChartScale::Linear => (&active_style, &inactive_style, &inactive_style),
+                ChartScale::Log => (&inactive_style, &active_style, &inactive_style),
+                ChartScale::LogLog => (&inactive_style, &inactive_style, &active_style),
+            };
+
+            let _ = linear_btn.set_attribute("style", linear_style);
+            let _ = log_btn.set_attribute("style", log_style);
+            let _ = loglog_btn.set_attribute("style", loglog_style);
         }
     });
 
@@ -2096,6 +2247,35 @@ fn update_metrics(document: &Document) -> Result<(), JsValue> {
             if let Some(el) = document.get_element_by_id("metric-accuracy") {
                 el.set_text_content(Some(&format!("Accuracy: {:.1}%", s.metrics.accuracy * 100.0)));
             }
+            if let Some(el) = document.get_element_by_id("metric-flops") {
+                // Calculate FLOPS: (samples_seen * flops_per_sample) / elapsed_seconds
+                if let Some(start_time) = s.metrics.training_start_time {
+                    let elapsed_ms = js_sys::Date::now() - start_time;
+                    if elapsed_ms > 0.0 && s.metrics.samples_seen > 0 {
+                        let total_flops = s.metrics.samples_seen as f64 * s.metrics.flops_per_sample as f64;
+                        let flops_per_sec = total_flops / (elapsed_ms / 1000.0);
+
+                        // Format with appropriate suffix
+                        let (value, suffix) = if flops_per_sec >= 1e12 {
+                            (flops_per_sec / 1e12, "TFLOPS")
+                        } else if flops_per_sec >= 1e9 {
+                            (flops_per_sec / 1e9, "GFLOPS")
+                        } else if flops_per_sec >= 1e6 {
+                            (flops_per_sec / 1e6, "MFLOPS")
+                        } else if flops_per_sec >= 1e3 {
+                            (flops_per_sec / 1e3, "KFLOPS")
+                        } else {
+                            (flops_per_sec, "FLOPS")
+                        };
+
+                        el.set_text_content(Some(&format!("{:.2} {}", value, suffix)));
+                    } else {
+                        el.set_text_content(Some("FLOPS: -"));
+                    }
+                } else {
+                    el.set_text_content(Some("FLOPS: -"));
+                }
+            }
         }
     });
 
@@ -2128,19 +2308,32 @@ fn render_loss_chart(document: &Document) -> Result<(), JsValue> {
                 return;
             }
 
-            let log_scale = s.metrics.log_scale;
+            let chart_scale = s.metrics.chart_scale;
+            let log_y = matches!(chart_scale, ChartScale::Log | ChartScale::LogLog);
+            let log_x = matches!(chart_scale, ChartScale::LogLog);
 
-            // Transform values if log scale
-            let values: Vec<f64> = if log_scale {
+            // Transform Y values if log scale
+            let y_values: Vec<f64> = if log_y {
                 history.iter().map(|&v| (v.max(1e-7) as f64).ln()).collect()
             } else {
                 history.iter().map(|&v| v as f64).collect()
             };
 
-            // Find min/max for scaling (always show full history)
-            let max_val = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-            let min_val = values.iter().cloned().fold(f64::INFINITY, f64::min);
-            let range = (max_val - min_val).max(0.1);
+            // Transform X values if log-log scale
+            let x_values: Vec<f64> = if log_x {
+                (0..history.len()).map(|i| ((i + 1) as f64).ln()).collect()
+            } else {
+                (0..history.len()).map(|i| i as f64).collect()
+            };
+
+            // Find min/max for scaling
+            let max_y = y_values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let min_y = y_values.iter().cloned().fold(f64::INFINITY, f64::min);
+            let range_y = (max_y - min_y).max(0.1);
+
+            let max_x = x_values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let min_x = x_values.iter().cloned().fold(f64::INFINITY, f64::min);
+            let range_x = (max_x - min_x).max(0.1);
 
             // Draw line
             ctx.set_stroke_style_str(ACCENT_COLOR);
@@ -2151,9 +2344,9 @@ fn render_loss_chart(document: &Document) -> Result<(), JsValue> {
             let chart_width = width - 2.0 * padding;
             let chart_height = height - 2.0 * padding;
 
-            for (i, &val) in values.iter().enumerate() {
-                let x = padding + (i as f64 / (values.len() - 1) as f64) * chart_width;
-                let y = padding + (1.0 - (val - min_val) / range) * chart_height;
+            for i in 0..y_values.len() {
+                let x = padding + ((x_values[i] - min_x) / range_x) * chart_width;
+                let y = padding + (1.0 - (y_values[i] - min_y) / range_y) * chart_height;
 
                 if i == 0 {
                     ctx.move_to(x, y);
@@ -2168,8 +2361,8 @@ fn render_loss_chart(document: &Document) -> Result<(), JsValue> {
             ctx.set_font("9px sans-serif");
             ctx.set_text_align("left");
 
-            let max_display = if log_scale { max_val.exp() } else { max_val };
-            let min_display = if log_scale { min_val.exp() } else { min_val };
+            let max_display = if log_y { max_y.exp() } else { max_y };
+            let min_display = if log_y { min_y.exp() } else { min_y };
 
             let _ = ctx.fill_text(&format!("{:.2}", max_display), 2.0, 10.0);
             let _ = ctx.fill_text(&format!("{:.2}", min_display), 2.0, height - 2.0);
