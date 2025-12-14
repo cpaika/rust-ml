@@ -8,22 +8,18 @@
 //! - Async buffer reading that works in WASM (no blocking)
 //! - Staging buffer management for efficient readback
 
-#[cfg(feature = "gpu")]
 use wgpu;
-#[cfg(feature = "gpu")]
 use bytemuck;
-#[cfg(feature = "gpu")]
 use std::sync::Arc;
 
 /// A persistent GPU buffer with known size
-#[cfg(feature = "gpu")]
 pub struct GpuBuffer {
     buffer: wgpu::Buffer,
     size: usize,  // Number of f32 elements
     label: String,
 }
 
-#[cfg(feature = "gpu")]
+
 impl GpuBuffer {
     /// Create a new GPU buffer with the given size (in f32 elements)
     pub fn new(device: &wgpu::Device, size: usize, label: &str) -> Self {
@@ -86,7 +82,6 @@ impl GpuBuffer {
 }
 
 /// GPU buffers for a single layer
-#[cfg(feature = "gpu")]
 pub struct GpuLayerBuffers {
     pub weights: GpuBuffer,      // input_size × output_size
     pub biases: GpuBuffer,       // output_size
@@ -100,7 +95,6 @@ pub struct GpuLayerBuffers {
     pub output_size: usize,
 }
 
-#[cfg(feature = "gpu")]
 impl GpuLayerBuffers {
     /// Create new layer buffers from CPU layer data
     pub fn new(
@@ -140,11 +134,9 @@ impl GpuLayerBuffers {
 
 /// Number of input buffers in the pool for batched submissions
 /// Higher = fewer GPU submissions but more memory usage
-#[cfg(feature = "gpu")]
 pub const INPUT_BUFFER_POOL_SIZE: usize = 32;
 
 /// All GPU buffers for a complete network
-#[cfg(feature = "gpu")]
 pub struct GpuNetworkBuffers {
     pub input: GpuBuffer,        // Single input buffer (legacy, for non-batched use)
     pub input_pool: Vec<GpuBuffer>,  // Pool of input buffers for batched submissions
@@ -153,7 +145,6 @@ pub struct GpuNetworkBuffers {
     staging_size: usize,
 }
 
-#[cfg(feature = "gpu")]
 impl GpuNetworkBuffers {
     /// Create network buffers from a CPU network
     pub fn from_network(
@@ -248,7 +239,6 @@ impl GpuNetworkBuffers {
 // These utilities allow non-blocking buffer reads that work in WASM.
 
 /// State of a pending async buffer read
-#[cfg(feature = "gpu")]
 pub enum AsyncReadState {
     /// No read is pending
     Idle,
@@ -264,7 +254,6 @@ pub enum AsyncReadState {
 ///
 /// This is designed to work in WASM where we can't block on GPU operations.
 /// Instead, we initiate a read and poll for completion.
-#[cfg(feature = "gpu")]
 pub struct AsyncBufferReader {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
@@ -276,7 +265,6 @@ pub struct AsyncBufferReader {
     pending_size: std::cell::Cell<usize>,
 }
 
-#[cfg(feature = "gpu")]
 impl AsyncBufferReader {
     /// Create a new async buffer reader
     pub fn new(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>, max_size: usize) -> Self {
@@ -468,7 +456,6 @@ impl AsyncBufferReader {
 }
 
 /// Helper to copy buffer to staging and read asynchronously
-#[cfg(feature = "gpu")]
 pub fn copy_buffer_to_staging(
     encoder: &mut wgpu::CommandEncoder,
     src_buffer: &wgpu::Buffer,
@@ -479,7 +466,7 @@ pub fn copy_buffer_to_staging(
     encoder.copy_buffer_to_buffer(src_buffer, 0, staging_buffer, 0, byte_size);
 }
 
-#[cfg(all(test, feature = "gpu"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::Network;

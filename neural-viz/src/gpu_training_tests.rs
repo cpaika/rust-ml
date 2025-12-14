@@ -1,7 +1,7 @@
 //! End-to-end tests for GPU training integration
 //! These tests exercise the same code paths that run in the browser
 
-#[cfg(all(test, feature = "gpu"))]
+#[cfg(test)]
 mod tests {
     use common::parse_digits_from_bytes;
     use neural::mnist::MnistSample;

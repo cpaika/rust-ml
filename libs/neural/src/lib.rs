@@ -3,20 +3,16 @@
 //! This implementation uses dense matrices for weights to enable fast
 //! forward/backward passes suitable for training MNIST in the browser.
 //!
-//! GPU acceleration is available via WebGPU when the `gpu` feature is enabled.
+//! GPU acceleration is available via WebGPU.
 
 pub mod mnist;
 
-#[cfg(any(feature = "gpu", test))]
 pub mod gpu;
 
-#[cfg(any(feature = "gpu", test))]
 pub mod gpu_buffers;
 
-#[cfg(any(feature = "gpu", test))]
 mod gpu_network;
 
-#[cfg(any(feature = "gpu", test))]
 pub use gpu_network::{GpuNetwork, WeightSyncState};
 
 use rand::Rng;

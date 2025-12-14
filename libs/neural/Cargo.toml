@@ -3,27 +3,17 @@ name = "neural"
 version = "0.1.0"
 edition = "2024"
 
-[features]
-default = []
-gpu = ["wgpu", "pollster", "bytemuck", "futures-channel"]
-
 [dependencies]
 rand = "0.8"
 getrandom = { version = "0.2", features = ["js"] }
 common = { path = "../common" }
 
-# GPU dependencies (optional)
-wgpu = { version = "23", optional = true }
-pollster = { version = "0.4", optional = true }
-bytemuck = { version = "1.14", features = ["derive"], optional = true }
-futures-channel = { version = "0.3", optional = true }
+# GPU dependencies (always included)
+wgpu = "23"
+pollster = "0.4"
+bytemuck = { version = "1.14", features = ["derive"] }
+futures-channel = "0.3"
 
 # WASM logging (enabled for wasm32 target)
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-sys = { version = "0.3", features = ["console"] }
-
-[dev-dependencies]
-# For GPU tests
-wgpu = "23"
-pollster = "0.4"
-bytemuck = { version = "1.14", features = ["derive"] }

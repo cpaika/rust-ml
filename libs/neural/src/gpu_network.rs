@@ -1717,4 +1717,85 @@ mod tests {
             "CPU and GPU accuracy differ too much: CPU={:.2}%, GPU={:.2}%",
             cpu_acc * 100.0, gpu_acc * 100.0);
     }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn benchmark_cpu_vs_gpu_training() {
+        use std::time::Instant;
+
+        let loader = MnistLoader::from_file(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../perceptron/digit-recognizer/train.csv"),
+            10000
+        ).unwrap();
+
+        let samples = loader.samples();
+        let batch_size = 32;
+        let num_batches = 200;  // More batches for stable measurement
+
+        // Prepare data
+        let train_inputs: Vec<Vec<f32>> = samples[0..batch_size * num_batches]
+            .iter()
+            .map(|s| s.normalized_pixels().iter().map(|&x| x as f32).collect())
+            .collect();
+        let train_labels: Vec<u8> = samples[0..batch_size * num_batches]
+            .iter()
+            .map(|s| s.label())
+            .collect();
+
+        println!("\n========================================");
+        println!("BENCHMARK: CPU vs GPU Training Speed");
+        println!("Network: 784 -> 128 -> 10");
+        println!("Batch size: {}, Batches: {}", batch_size, num_batches);
+        println!("Total samples: {}", batch_size * num_batches);
+        println!("========================================\n");
+
+        // Benchmark CPU
+        let cpu_net = Network::mnist_default();
+        let mut cpu_net_clone = cpu_net.clone();
+
+        let cpu_start = Instant::now();
+        for batch_idx in 0..num_batches {
+            let start = batch_idx * batch_size;
+            let end = start + batch_size;
+            cpu_net_clone.train_batch(&train_inputs[start..end].to_vec(), &train_labels[start..end], 0.1);
+        }
+        let cpu_duration = cpu_start.elapsed();
+        let cpu_ms = cpu_duration.as_secs_f64() * 1000.0;
+        let cpu_samples_per_sec = (batch_size * num_batches) as f64 / cpu_duration.as_secs_f64();
+
+        println!("CPU Training:");
+        println!("  Total time: {:.2} ms", cpu_ms);
+        println!("  Per batch:  {:.3} ms", cpu_ms / num_batches as f64);
+        println!("  Throughput: {:.0} samples/sec", cpu_samples_per_sec);
+
+        // Benchmark GPU
+        let mut gpu_net = GpuNetwork::from_network(cpu_net).expect("Failed to create GPU network");
+        gpu_net.init_persistent_buffers();
+
+        let gpu_start = Instant::now();
+        for batch_idx in 0..num_batches {
+            let start = batch_idx * batch_size;
+            let end = start + batch_size;
+            gpu_net.train_batch_gpu_full(&train_inputs[start..end].to_vec(), &train_labels[start..end], 0.1);
+        }
+        // Sync to ensure all GPU work is done
+        gpu_net.sync_weights_to_cpu();
+        let gpu_duration = gpu_start.elapsed();
+        let gpu_ms = gpu_duration.as_secs_f64() * 1000.0;
+        let gpu_samples_per_sec = (batch_size * num_batches) as f64 / gpu_duration.as_secs_f64();
+
+        println!("\nGPU Training:");
+        println!("  Total time: {:.2} ms", gpu_ms);
+        println!("  Per batch:  {:.3} ms", gpu_ms / num_batches as f64);
+        println!("  Throughput: {:.0} samples/sec", gpu_samples_per_sec);
+
+        let speedup = cpu_ms / gpu_ms;
+        println!("\n----------------------------------------");
+        if speedup > 1.0 {
+            println!("GPU is {:.2}x FASTER than CPU", speedup);
+        } else {
+            println!("GPU is {:.2}x SLOWER than CPU", 1.0 / speedup);
+        }
+        println!("----------------------------------------\n");
+    }
 }

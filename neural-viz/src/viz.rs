@@ -3,7 +3,6 @@ use neural::{Network, mnist::MnistSample};
 use wasm_bindgen::prelude::*;
 use web_sys::{CanvasRenderingContext2d, Document, HtmlCanvasElement, HtmlElement, MouseEvent, WheelEvent};
 
-#[cfg(feature = "gpu")]
 use neural::{GpuNetwork, WeightSyncState};
 
 const INPUT_PANEL_WIDTH: f64 = 200.0;
@@ -86,8 +85,11 @@ impl Default for TrainingMetrics {
 
 struct State {
     network: Network,
-    digits: Vec<Digit>,
+    // Training data - used only for training
+    train_digits: Vec<Digit>,
     samples: Vec<MnistSample>,
+    // Validation data - never trained on, used for accuracy metrics and Random Image
+    validation_digits: Vec<Digit>,
     current_digit_idx: Option<usize>,
     neuron_positions: Vec<NeuronPosition>,
     hovered_neuron: Option<(usize, usize)>,
@@ -114,18 +116,35 @@ struct State {
     accelerator_mode: AcceleratorMode,
     gpu_available: bool,
     gpu_init_state: GpuInitState,
+    // Drawing mode for custom digit input
+    drawing_mode: bool,
+    drawn_pixels: [u8; 784],
+    is_drawing: bool,
+    last_draw_pos: Option<(f64, f64)>,
 }
 
+// Number of samples to hold out for validation (never trained on)
+const VALIDATION_SIZE: usize = 4000;
+
 impl State {
-    fn new(network: Network, digits: Vec<Digit>, canvas_width: f64, canvas_height: f64, gpu_available: bool) -> Self {
+    fn new(network: Network, all_digits: Vec<Digit>, canvas_width: f64, canvas_height: f64, gpu_available: bool) -> Self {
         let neuron_positions = Self::calculate_positions(&network, canvas_width, canvas_height);
-        let samples: Vec<MnistSample> = digits.iter().map(|d| MnistSample::new(d.clone())).collect();
         let num_layers = network.layer_sizes().len();
+
+        // Split data: last VALIDATION_SIZE samples for validation, rest for training
+        let split_point = all_digits.len().saturating_sub(VALIDATION_SIZE);
+        let mut all_digits = all_digits;
+        let validation_digits: Vec<Digit> = all_digits.split_off(split_point);
+        let train_digits = all_digits; // Remaining digits are for training
+
+        // Only create training samples from training data
+        let samples: Vec<MnistSample> = train_digits.iter().map(|d| MnistSample::new(d.clone())).collect();
 
         Self {
             network,
-            digits,
+            train_digits,
             samples,
+            validation_digits,
             current_digit_idx: None,
             neuron_positions,
             hovered_neuron: None,
@@ -148,6 +167,206 @@ impl State {
             accelerator_mode: AcceleratorMode::Cpu, // Default to CPU
             gpu_available,
             gpu_init_state: GpuInitState::NotStarted,
+            drawing_mode: false,
+            drawn_pixels: [0u8; 784],
+            is_drawing: false,
+            last_draw_pos: None,
+        }
+    }
+
+    /// Preprocess drawn pixels to match MNIST format:
+    /// - Center by center of mass
+    /// - Scale to fit in ~20x20 box (MNIST standard)
+    fn preprocess_drawn(&self) -> [u8; 784] {
+        let mut result = [0u8; 784];
+
+        // Find bounding box and center of mass
+        let mut min_x = 28i32;
+        let mut max_x = 0i32;
+        let mut min_y = 28i32;
+        let mut max_y = 0i32;
+        let mut mass_x = 0.0f64;
+        let mut mass_y = 0.0f64;
+        let mut total_mass = 0.0f64;
+
+        for y in 0..28 {
+            for x in 0..28 {
+                let val = self.drawn_pixels[y * 28 + x] as f64;
+                if val > 0.0 {
+                    min_x = min_x.min(x as i32);
+                    max_x = max_x.max(x as i32);
+                    min_y = min_y.min(y as i32);
+                    max_y = max_y.max(y as i32);
+                    mass_x += x as f64 * val;
+                    mass_y += y as f64 * val;
+                    total_mass += val;
+                }
+            }
+        }
+
+        // If nothing drawn, return empty
+        if total_mass == 0.0 {
+            return result;
+        }
+
+        // Center of mass
+        let com_x = mass_x / total_mass;
+        let com_y = mass_y / total_mass;
+
+        // Bounding box size
+        let width = (max_x - min_x + 1) as f64;
+        let height = (max_y - min_y + 1) as f64;
+
+        // MNIST digits fit in ~20x20 box, centered in 28x28
+        // Scale factor to fit the larger dimension into 20 pixels
+        let target_size = 20.0;
+        let scale = if width > height {
+            target_size / width
+        } else {
+            target_size / height
+        };
+
+        // Don't upscale small drawings too much (max 2x)
+        let scale = scale.min(2.0);
+
+        // Target center is 13.5, 13.5 (center of 28x28 grid)
+        let target_cx = 13.5;
+        let target_cy = 13.5;
+
+        // For each pixel in output, sample from input with bilinear interpolation
+        for out_y in 0..28 {
+            for out_x in 0..28 {
+                // Map output pixel back to input coordinates
+                // out = (in - com) * scale + target_center
+                // in = (out - target_center) / scale + com
+                let in_x = (out_x as f64 - target_cx) / scale + com_x;
+                let in_y = (out_y as f64 - target_cy) / scale + com_y;
+
+                // Bilinear interpolation
+                let x0 = in_x.floor() as i32;
+                let y0 = in_y.floor() as i32;
+                let x1 = x0 + 1;
+                let y1 = y0 + 1;
+
+                let fx = in_x - x0 as f64;
+                let fy = in_y - y0 as f64;
+
+                let get_pixel = |x: i32, y: i32| -> f64 {
+                    if x >= 0 && x < 28 && y >= 0 && y < 28 {
+                        self.drawn_pixels[(y * 28 + x) as usize] as f64
+                    } else {
+                        0.0
+                    }
+                };
+
+                let v00 = get_pixel(x0, y0);
+                let v10 = get_pixel(x1, y0);
+                let v01 = get_pixel(x0, y1);
+                let v11 = get_pixel(x1, y1);
+
+                let value = v00 * (1.0 - fx) * (1.0 - fy)
+                    + v10 * fx * (1.0 - fy)
+                    + v01 * (1.0 - fx) * fy
+                    + v11 * fx * fy;
+
+                result[out_y * 28 + out_x] = (value.min(255.0).max(0.0)) as u8;
+            }
+        }
+
+        result
+    }
+
+    /// Classify the drawn pixels and update activations
+    fn classify_drawn(&mut self) {
+        // Preprocess to center and scale like MNIST
+        let preprocessed = self.preprocess_drawn();
+        let input: Vec<f32> = preprocessed.iter().map(|&p| p as f32 / 255.0).collect();
+        let output = self.network.forward(&input);
+
+        // Store activations for each layer (using preprocessed input)
+        self.current_activations = vec![input.clone()]; // Input layer
+        for i in 0..self.network.num_layers() {
+            if let Some(acts) = self.network.get_activations(i) {
+                self.current_activations.push(acts.clone());
+            }
+        }
+
+        // Find prediction
+        self.current_prediction = output
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(idx, _)| idx);
+    }
+
+    /// Clear the drawing canvas
+    fn clear_drawing(&mut self) {
+        self.drawn_pixels = [0u8; 784];
+        self.current_activations.clear();
+        self.current_prediction = None;
+    }
+
+    /// Draw at a position on the 28x28 grid with MNIST-like brush
+    /// MNIST digits have strokes ~2-3 pixels wide with Gaussian-like anti-aliasing
+    fn draw_at(&mut self, canvas_x: f64, canvas_y: f64, canvas_size: f64) {
+        // Convert canvas position to 28x28 grid (floating point for sub-pixel accuracy)
+        let scale = 28.0 / canvas_size;
+        let grid_x = canvas_x * scale;
+        let grid_y = canvas_y * scale;
+
+        // MNIST-like brush: ~2-3 pixel stroke width with smooth Gaussian falloff
+        // Brush radius in grid space - MNIST strokes are typically 2-3 pixels wide
+        let brush_radius: f64 = 1.8;
+        let sigma: f64 = 0.9; // Controls the falloff steepness
+
+        // Check pixels in a 5x5 area around the brush center
+        let center_x = grid_x.floor() as i32;
+        let center_y = grid_y.floor() as i32;
+
+        for dy in -2..=2 {
+            for dx in -2..=2 {
+                let px = center_x + dx;
+                let py = center_y + dy;
+                if px >= 0 && px < 28 && py >= 0 && py < 28 {
+                    let idx = (py * 28 + px) as usize;
+
+                    // Calculate distance from brush center to pixel center
+                    let pixel_center_x = px as f64 + 0.5;
+                    let pixel_center_y = py as f64 + 0.5;
+                    let dist = ((grid_x - pixel_center_x).powi(2) + (grid_y - pixel_center_y).powi(2)).sqrt();
+
+                    // Gaussian falloff matching MNIST anti-aliasing
+                    // MNIST has bright cores (255) that fall off smoothly to edges
+                    let intensity = if dist < brush_radius {
+                        // Gaussian: exp(-dist^2 / (2 * sigma^2))
+                        let falloff = (-dist.powi(2) / (2.0 * sigma.powi(2))).exp();
+                        (255.0 * falloff) as u8
+                    } else {
+                        0
+                    };
+
+                    // Max blend for overlapping strokes (like real pen strokes)
+                    if intensity > 0 {
+                        self.drawn_pixels[idx] = self.drawn_pixels[idx].max(intensity);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Draw a line between two points (for smooth strokes)
+    fn draw_line(&mut self, x1: f64, y1: f64, x2: f64, y2: f64, canvas_size: f64) {
+        let dx = x2 - x1;
+        let dy = y2 - y1;
+        let dist = (dx * dx + dy * dy).sqrt();
+        // Step more frequently for smoother lines (every 1.5 canvas pixels)
+        let steps = (dist / 1.5).max(1.0) as i32;
+
+        for i in 0..=steps {
+            let t = i as f64 / steps as f64;
+            let x = x1 + dx * t;
+            let y = y1 + dy * t;
+            self.draw_at(x, y, canvas_size);
         }
     }
 
@@ -295,12 +514,13 @@ impl State {
     fn load_random_digit(&mut self) {
         use rand::Rng;
         let mut rng = rand::thread_rng();
-        let next_idx = rng.gen_range(0..self.digits.len());
+        // Use validation set for Random Image - these are never trained on
+        let next_idx = rng.gen_range(0..self.validation_digits.len());
         self.current_digit_idx = Some(next_idx);
 
-        // Run forward pass using the DIGIT (not shuffled samples array)
-        // This ensures the displayed digit matches what we're predicting
-        let digit = &self.digits[next_idx];
+        // Run forward pass using the validation digit
+        // This tests true generalization since these images were never trained on
+        let digit = &self.validation_digits[next_idx];
         let input: Vec<f32> = digit.pixels().iter().map(|&p| p as f32 / 255.0).collect();
         let output = self.network.forward(&input);
 
@@ -379,16 +599,16 @@ impl State {
             self.metrics.loss_history.push(loss);
 
             // Evaluate accuracy periodically (every 10 batches)
-            // Use digits array (not shuffled) from the END as validation set
+            // Use validation_digits - these are NEVER trained on
             // This gives us a true measure of generalization
             if self.current_batch_idx % 10 == 0 {
-                let val_size = 500;
-                let val_start = self.digits.len().saturating_sub(val_size);
-                let eval_inputs: Vec<Vec<f32>> = self.digits[val_start..]
+                // Use first 500 of validation set for speed (still never trained on)
+                let val_size = 500.min(self.validation_digits.len());
+                let eval_inputs: Vec<Vec<f32>> = self.validation_digits[..val_size]
                     .iter()
                     .map(|d| d.pixels().iter().map(|&p| p as f32 / 255.0).collect())
                     .collect();
-                let eval_labels: Vec<u8> = self.digits[val_start..]
+                let eval_labels: Vec<u8> = self.validation_digits[..val_size]
                     .iter()
                     .map(|d| d.label())
                     .collect();
@@ -405,7 +625,6 @@ thread_local! {
     static STATE: std::cell::RefCell<Option<State>> = const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(feature = "gpu")]
 thread_local! {
     static GPU_NETWORK: std::cell::RefCell<Option<GpuNetwork>> = const { std::cell::RefCell::new(None) };
 }
@@ -445,26 +664,18 @@ pub fn init(csv_data: &[u8]) -> Result<(), JsValue> {
 /// Check if WebGPU is available in the browser
 fn check_webgpu_available(_window: &web_sys::Window) -> bool {
     // WebGPU availability check - the navigator.gpu property exists when WebGPU is supported
-    #[cfg(feature = "gpu")]
-    {
-        if let Some(window) = web_sys::window() {
-            let navigator = window.navigator();
-            // Check if gpu property exists on navigator
-            let gpu = js_sys::Reflect::get(&navigator, &"gpu".into());
-            if let Ok(gpu_val) = gpu {
-                return !gpu_val.is_undefined() && !gpu_val.is_null();
-            }
+    if let Some(window) = web_sys::window() {
+        let navigator = window.navigator();
+        // Check if gpu property exists on navigator
+        let gpu = js_sys::Reflect::get(&navigator, &"gpu".into());
+        if let Ok(gpu_val) = gpu {
+            return !gpu_val.is_undefined() && !gpu_val.is_null();
         }
-        false
     }
-    #[cfg(not(feature = "gpu"))]
-    {
-        false // GPU feature not compiled in
-    }
+    false
 }
 
 /// Initialize GPU network asynchronously
-#[cfg(feature = "gpu")]
 fn init_gpu_async(document: Document) {
     use wasm_bindgen_futures::spawn_local;
 
@@ -515,7 +726,6 @@ fn init_gpu_async(document: Document) {
 }
 
 /// Sync CPU network weights to GPU network (if initialized)
-#[cfg(feature = "gpu")]
 #[allow(dead_code)]
 fn sync_network_to_gpu() {
     STATE.with(|state| {
@@ -535,7 +745,6 @@ fn sync_network_to_gpu() {
 }
 
 /// Sync GPU network weights back to CPU network
-#[cfg(feature = "gpu")]
 #[allow(dead_code)]
 fn sync_network_from_gpu() {
     GPU_NETWORK.with(|gpu| {
@@ -562,7 +771,6 @@ fn sync_network_from_gpu() {
 /// - Weight updates: saxpy for SGD
 ///
 /// No CPU readback during training - only sync weights periodically for metrics.
-#[cfg(feature = "gpu")]
 fn train_batches_gpu(state: &mut State, num_batches: usize) {
     let total_samples = state.samples.len();
     let num_total_batches = total_samples / BATCH_SIZE;
@@ -607,14 +815,13 @@ fn train_batches_gpu(state: &mut State, num_batches: usize) {
                     }
                 }
 
-                // Evaluate accuracy at epoch end
-                let val_size = 500;
-                let val_start = state.digits.len().saturating_sub(val_size);
-                let eval_inputs: Vec<Vec<f32>> = state.digits[val_start..]
+                // Evaluate accuracy at epoch end using validation set (never trained on)
+                let val_size = 500.min(state.validation_digits.len());
+                let eval_inputs: Vec<Vec<f32>> = state.validation_digits[..val_size]
                     .iter()
                     .map(|d| d.pixels().iter().map(|&p| p as f32 / 255.0).collect())
                     .collect();
-                let eval_labels: Vec<u8> = state.digits[val_start..]
+                let eval_labels: Vec<u8> = state.validation_digits[..val_size]
                     .iter()
                     .map(|d| d.label())
                     .collect();
@@ -672,13 +879,13 @@ fn train_batches_gpu(state: &mut State, num_batches: usize) {
                     cpu_layer.biases.copy_from_slice(&gpu_layer.biases);
                 }
 
-                let val_size = 500;
-                let val_start = state.digits.len().saturating_sub(val_size);
-                let eval_inputs: Vec<Vec<f32>> = state.digits[val_start..]
+                // Evaluate on validation set (never trained on)
+                let val_size = 500.min(state.validation_digits.len());
+                let eval_inputs: Vec<Vec<f32>> = state.validation_digits[..val_size]
                     .iter()
                     .map(|d| d.pixels().iter().map(|&p| p as f32 / 255.0).collect())
                     .collect();
-                let eval_labels: Vec<u8> = state.digits[val_start..]
+                let eval_labels: Vec<u8> = state.validation_digits[..val_size]
                     .iter()
                     .map(|d| d.label())
                     .collect();
@@ -874,6 +1081,72 @@ fn setup_ui(document: &Document, canvas_width: u32, canvas_height: u32) -> Resul
         ),
     )?;
     left_panel.append_child(&load_btn)?;
+
+    // Draw Your Own Button
+    let draw_btn = document.create_element("button")?;
+    draw_btn.set_id("draw-btn");
+    draw_btn.set_text_content(Some("Draw Your Own"));
+    draw_btn.set_attribute(
+        "style",
+        &format!(
+            "width: 100%; padding: 10px; font-size: 13px; cursor: pointer; \
+             background: transparent; color: {}; border: 1px solid {}; border-radius: 8px; \
+             transition: all 0.2s; margin-top: 6px;",
+            ACCENT_SECONDARY, ACCENT_SECONDARY
+        ),
+    )?;
+    left_panel.append_child(&draw_btn)?;
+
+    // Drawing controls container (hidden by default)
+    let draw_controls = document.create_element("div")?;
+    draw_controls.set_id("draw-controls");
+    draw_controls.set_attribute(
+        "style",
+        "display: none; flex-direction: row; gap: 6px; margin-top: 6px;",
+    )?;
+
+    // Clear button
+    let clear_btn = document.create_element("button")?;
+    clear_btn.set_id("clear-btn");
+    clear_btn.set_text_content(Some("Clear"));
+    clear_btn.set_attribute(
+        "style",
+        &format!(
+            "flex: 1; padding: 8px; font-size: 12px; cursor: pointer; \
+             background: transparent; color: {}; border: 1px solid {}; border-radius: 6px;",
+            TEXT_DIM, NEURON_STROKE
+        ),
+    )?;
+    draw_controls.append_child(&clear_btn)?;
+
+    // Done button (exits drawing mode)
+    let done_btn = document.create_element("button")?;
+    done_btn.set_id("done-btn");
+    done_btn.set_text_content(Some("Done"));
+    done_btn.set_attribute(
+        "style",
+        &format!(
+            "flex: 1; padding: 8px; font-size: 12px; cursor: pointer; \
+             background: {}; color: {}; border: none; border-radius: 6px;",
+            ACCENT_COLOR, BG_COLOR
+        ),
+    )?;
+    draw_controls.append_child(&done_btn)?;
+
+    left_panel.append_child(&draw_controls)?;
+
+    // Drawing mode label
+    let draw_label = document.create_element("div")?;
+    draw_label.set_id("draw-label");
+    draw_label.set_attribute(
+        "style",
+        &format!(
+            "display: none; color: {}; font-size: 11px; text-align: center; margin-top: 4px;",
+            ACCENT_SECONDARY
+        ),
+    )?;
+    draw_label.set_text_content(Some("Draw a digit (0-9)"));
+    left_panel.append_child(&draw_label)?;
 
     // Digit display
     let digit_canvas = document.create_element("canvas")?.dyn_into::<HtmlCanvasElement>()?;
@@ -1175,6 +1448,9 @@ fn setup_handlers(document: &Document) -> Result<(), JsValue> {
     let load_closure = Closure::wrap(Box::new(move |_event: MouseEvent| {
         STATE.with(|state| {
             if let Some(ref mut s) = *state.borrow_mut() {
+                // Exit drawing mode if active
+                s.drawing_mode = false;
+                s.is_drawing = false;
                 s.load_random_digit();
             }
         });
@@ -1188,6 +1464,185 @@ fn setup_handlers(document: &Document) -> Result<(), JsValue> {
         .dyn_into::<HtmlElement>()?
         .set_onclick(Some(load_closure.as_ref().unchecked_ref()));
     load_closure.forget();
+
+    // Draw button - enter drawing mode
+    let doc_clone = document.clone();
+    let draw_closure = Closure::wrap(Box::new(move |_event: MouseEvent| {
+        STATE.with(|state| {
+            if let Some(ref mut s) = *state.borrow_mut() {
+                s.drawing_mode = true;
+                s.current_digit_idx = None; // Clear current sample
+                s.drawn_pixels = [0u8; 784];
+                s.current_activations.clear();
+                s.current_prediction = None;
+            }
+        });
+        // Show drawing controls, hide draw button
+        if let Some(controls) = doc_clone.get_element_by_id("draw-controls") {
+            let _ = controls.dyn_into::<HtmlElement>().unwrap().style().set_property("display", "flex");
+        }
+        if let Some(label) = doc_clone.get_element_by_id("draw-label") {
+            let _ = label.dyn_into::<HtmlElement>().unwrap().style().set_property("display", "block");
+        }
+        if let Some(btn) = doc_clone.get_element_by_id("draw-btn") {
+            let _ = btn.dyn_into::<HtmlElement>().unwrap().style().set_property("display", "none");
+        }
+        if let Some(btn) = doc_clone.get_element_by_id("load-btn") {
+            let _ = btn.dyn_into::<HtmlElement>().unwrap().style().set_property("display", "none");
+        }
+        // Update canvas cursor
+        if let Some(canvas) = doc_clone.get_element_by_id("digit-canvas") {
+            let _ = canvas.dyn_into::<HtmlElement>().unwrap().style().set_property("cursor", "crosshair");
+        }
+        let _ = render_digit(&doc_clone);
+        let _ = render(&doc_clone);
+        let _ = update_prediction(&doc_clone);
+    }) as Box<dyn Fn(MouseEvent)>);
+    document
+        .get_element_by_id("draw-btn")
+        .ok_or("no draw button")?
+        .dyn_into::<HtmlElement>()?
+        .set_onclick(Some(draw_closure.as_ref().unchecked_ref()));
+    draw_closure.forget();
+
+    // Clear button - clear drawing
+    let doc_clone = document.clone();
+    let clear_closure = Closure::wrap(Box::new(move |_event: MouseEvent| {
+        STATE.with(|state| {
+            if let Some(ref mut s) = *state.borrow_mut() {
+                s.clear_drawing();
+            }
+        });
+        let _ = render_digit(&doc_clone);
+        let _ = render(&doc_clone);
+        let _ = update_prediction(&doc_clone);
+    }) as Box<dyn Fn(MouseEvent)>);
+    document
+        .get_element_by_id("clear-btn")
+        .ok_or("no clear button")?
+        .dyn_into::<HtmlElement>()?
+        .set_onclick(Some(clear_closure.as_ref().unchecked_ref()));
+    clear_closure.forget();
+
+    // Done button - exit drawing mode
+    let doc_clone = document.clone();
+    let done_closure = Closure::wrap(Box::new(move |_event: MouseEvent| {
+        STATE.with(|state| {
+            if let Some(ref mut s) = *state.borrow_mut() {
+                s.drawing_mode = false;
+                s.is_drawing = false;
+            }
+        });
+        // Hide drawing controls, show draw button
+        if let Some(controls) = doc_clone.get_element_by_id("draw-controls") {
+            let _ = controls.dyn_into::<HtmlElement>().unwrap().style().set_property("display", "none");
+        }
+        if let Some(label) = doc_clone.get_element_by_id("draw-label") {
+            let _ = label.dyn_into::<HtmlElement>().unwrap().style().set_property("display", "none");
+        }
+        if let Some(btn) = doc_clone.get_element_by_id("draw-btn") {
+            let _ = btn.dyn_into::<HtmlElement>().unwrap().style().set_property("display", "block");
+        }
+        if let Some(btn) = doc_clone.get_element_by_id("load-btn") {
+            let _ = btn.dyn_into::<HtmlElement>().unwrap().style().set_property("display", "block");
+        }
+        // Restore canvas cursor
+        if let Some(canvas) = doc_clone.get_element_by_id("digit-canvas") {
+            let _ = canvas.dyn_into::<HtmlElement>().unwrap().style().set_property("cursor", "default");
+        }
+    }) as Box<dyn Fn(MouseEvent)>);
+    document
+        .get_element_by_id("done-btn")
+        .ok_or("no done button")?
+        .dyn_into::<HtmlElement>()?
+        .set_onclick(Some(done_closure.as_ref().unchecked_ref()));
+    done_closure.forget();
+
+    // Digit canvas drawing events
+    let digit_canvas = document
+        .get_element_by_id("digit-canvas")
+        .ok_or("no digit canvas")?
+        .dyn_into::<HtmlCanvasElement>()?;
+
+    // Mouse down on digit canvas - start drawing
+    let doc_clone = document.clone();
+    let digit_mousedown = Closure::wrap(Box::new(move |event: MouseEvent| {
+        let canvas_size = 140.0;
+        let x = event.offset_x() as f64;
+        let y = event.offset_y() as f64;
+
+        STATE.with(|state| {
+            if let Some(ref mut s) = *state.borrow_mut() {
+                if s.drawing_mode {
+                    s.is_drawing = true;
+                    s.last_draw_pos = Some((x, y));
+                    s.draw_at(x, y, canvas_size);
+                    s.classify_drawn();
+                }
+            }
+        });
+        let _ = render_digit(&doc_clone);
+        let _ = render(&doc_clone);
+        let _ = update_prediction(&doc_clone);
+    }) as Box<dyn Fn(MouseEvent)>);
+    digit_canvas.add_event_listener_with_callback("mousedown", digit_mousedown.as_ref().unchecked_ref())?;
+    digit_mousedown.forget();
+
+    // Mouse move on digit canvas - continue drawing
+    let doc_clone = document.clone();
+    let digit_mousemove = Closure::wrap(Box::new(move |event: MouseEvent| {
+        let canvas_size = 140.0;
+        let x = event.offset_x() as f64;
+        let y = event.offset_y() as f64;
+
+        let should_render = STATE.with(|state| {
+            if let Some(ref mut s) = *state.borrow_mut() {
+                if s.drawing_mode && s.is_drawing {
+                    if let Some((last_x, last_y)) = s.last_draw_pos {
+                        s.draw_line(last_x, last_y, x, y, canvas_size);
+                    } else {
+                        s.draw_at(x, y, canvas_size);
+                    }
+                    s.last_draw_pos = Some((x, y));
+                    s.classify_drawn();
+                    return true;
+                }
+            }
+            false
+        });
+
+        if should_render {
+            let _ = render_digit(&doc_clone);
+            let _ = render(&doc_clone);
+            let _ = update_prediction(&doc_clone);
+        }
+    }) as Box<dyn Fn(MouseEvent)>);
+    digit_canvas.add_event_listener_with_callback("mousemove", digit_mousemove.as_ref().unchecked_ref())?;
+    digit_mousemove.forget();
+
+    // Mouse up on digit canvas - stop drawing
+    let digit_mouseup = Closure::wrap(Box::new(move |_event: MouseEvent| {
+        STATE.with(|state| {
+            if let Some(ref mut s) = *state.borrow_mut() {
+                s.is_drawing = false;
+                s.last_draw_pos = None;
+            }
+        });
+    }) as Box<dyn Fn(MouseEvent)>);
+    digit_canvas.add_event_listener_with_callback("mouseup", digit_mouseup.as_ref().unchecked_ref())?;
+    digit_mouseup.forget();
+
+    // Mouse leave on digit canvas - stop drawing
+    let digit_mouseleave = Closure::wrap(Box::new(move |_event: MouseEvent| {
+        STATE.with(|state| {
+            if let Some(ref mut s) = *state.borrow_mut() {
+                s.is_drawing = false;
+                s.last_draw_pos = None;
+            }
+        });
+    }) as Box<dyn Fn(MouseEvent)>);
+    digit_canvas.add_event_listener_with_callback("mouseleave", digit_mouseleave.as_ref().unchecked_ref())?;
+    digit_mouseleave.forget();
 
     // Train button
     let doc_clone = document.clone();
@@ -1235,7 +1690,6 @@ fn setup_handlers(document: &Document) -> Result<(), JsValue> {
             }
         });
         // Clear GPU network on reset
-        #[cfg(feature = "gpu")]
         GPU_NETWORK.with(|gpu| {
             *gpu.borrow_mut() = None;
         });
@@ -1300,11 +1754,8 @@ fn setup_handlers(document: &Document) -> Result<(), JsValue> {
         });
 
         // If switching to GPU and not initialized yet, start async initialization
-        #[cfg(feature = "gpu")]
-        {
-            if new_mode == AcceleratorMode::Gpu && gpu_available && gpu_init_state == GpuInitState::NotStarted {
-                init_gpu_async(doc_clone.clone());
-            }
+        if new_mode == AcceleratorMode::Gpu && gpu_available && gpu_init_state == GpuInitState::NotStarted {
+            init_gpu_async(doc_clone.clone());
         }
 
         let _ = update_gpu_button(&doc_clone);
@@ -1407,7 +1858,7 @@ fn setup_handlers(document: &Document) -> Result<(), JsValue> {
 
 /// Poll for async weight sync completion at the start of each frame
 /// This is called before training new batches to check if previous sync completed
-#[cfg(all(feature = "gpu", target_arch = "wasm32"))]
+#[cfg(target_arch = "wasm32")]
 fn poll_gpu_weight_sync(state: &mut State) {
     GPU_NETWORK.with(|gpu| {
         let mut gpu_borrow = gpu.borrow_mut();
@@ -1427,14 +1878,13 @@ fn poll_gpu_weight_sync(state: &mut State) {
                     cpu_layer.biases.copy_from_slice(&gpu_layer.biases);
                 }
 
-                // Evaluate with real weights
-                let val_size = 500;
-                let val_start = state.digits.len().saturating_sub(val_size);
-                let eval_inputs: Vec<Vec<f32>> = state.digits[val_start..]
+                // Evaluate with real weights on validation set (never trained on)
+                let val_size = 500.min(state.validation_digits.len());
+                let eval_inputs: Vec<Vec<f32>> = state.validation_digits[..val_size]
                     .iter()
                     .map(|d| d.pixels().iter().map(|&p| p as f32 / 255.0).collect())
                     .collect();
-                let eval_labels: Vec<u8> = state.digits[val_start..]
+                let eval_labels: Vec<u8> = state.validation_digits[..val_size]
                     .iter()
                     .map(|d| d.label())
                     .collect();
@@ -1458,20 +1908,17 @@ fn start_training_loop(document: Document) {
             if let Some(ref mut s) = *state.borrow_mut() {
                 // Poll for async weight sync completion at the START of each frame
                 // This is when the async callbacks will have fired from the previous frame
-                #[cfg(all(feature = "gpu", target_arch = "wasm32"))]
+                #[cfg(target_arch = "wasm32")]
                 poll_gpu_weight_sync(s);
 
                 if s.training_state == TrainingState::Training {
                     // Check if we should use GPU training
-                    #[cfg(feature = "gpu")]
                     let use_gpu = s.accelerator_mode == AcceleratorMode::Gpu
                         && s.gpu_init_state == GpuInitState::Ready;
-                    #[cfg(not(feature = "gpu"))]
-                    let use_gpu = false;
 
                     // In WASM with GPU: don't train while weight sync is in progress
                     // Training commands would queue up and delay the sync completion
-                    #[cfg(all(feature = "gpu", target_arch = "wasm32"))]
+                    #[cfg(target_arch = "wasm32")]
                     let skip_training = {
                         if use_gpu {
                             GPU_NETWORK.with(|gpu| {
@@ -1481,17 +1928,14 @@ fn start_training_loop(document: Document) {
                             false
                         }
                     };
-                    #[cfg(not(all(feature = "gpu", target_arch = "wasm32")))]
+                    #[cfg(not(target_arch = "wasm32"))]
                     let skip_training = false;
 
                     if skip_training {
                         // Skip training this frame to let weight sync complete
                         (true, false, 0.0)
                     } else if use_gpu {
-                        #[cfg(feature = "gpu")]
-                        {
-                            train_batches_gpu(s, BATCHES_PER_FRAME);
-                        }
+                        train_batches_gpu(s, BATCHES_PER_FRAME);
                         // Check if training just completed
                         let completed = s.training_state == TrainingState::Completed;
                         (true, completed, s.metrics.accuracy)
@@ -1742,7 +2186,7 @@ fn update_prediction(document: &Document) -> Result<(), JsValue> {
         let state = state.borrow();
         if let Some(ref s) = *state {
             if let (Some(digit_idx), Some(pred)) = (s.current_digit_idx, s.current_prediction) {
-                let actual = s.digits[digit_idx].label();
+                let actual = s.validation_digits[digit_idx].label();
                 let correct = pred as u8 == actual;
                 let color = if correct { ACCENT_COLOR } else { ACCENT_SECONDARY };
 
@@ -1871,9 +2315,9 @@ fn update_weight_tooltip(document: &Document, mouse_x: f64, mouse_y: f64) -> Res
                 let row = pixel_idx / 28;
                 let col = pixel_idx % 28;
 
-                // Get pixel value
+                // Get pixel value from validation digit
                 let pixel_val = s.current_digit_idx
-                    .and_then(|idx| s.digits.get(idx))
+                    .and_then(|idx| s.validation_digits.get(idx))
                     .map(|d| d.pixels()[pixel_idx])
                     .unwrap_or(0);
 
@@ -1942,15 +2386,21 @@ fn render_digit(document: &Document) -> Result<(), JsValue> {
     STATE.with(|state| {
         let state = state.borrow();
         if let Some(ref s) = *state {
-            if let Some(digit_idx) = s.current_digit_idx {
-                let digit = &s.digits[digit_idx];
+            // Clear canvas
+            ctx.set_fill_style_str(BG_COLOR);
+            ctx.fill_rect(0.0, 0.0, 140.0, 140.0);
 
-                // Clear
-                ctx.set_fill_style_str(BG_COLOR);
-                ctx.fill_rect(0.0, 0.0, 140.0, 140.0);
+            // Get pixels to render - either from drawing or from loaded validation digit
+            let pixels: Option<&[u8]> = if s.drawing_mode {
+                Some(&s.drawn_pixels)
+            } else if let Some(digit_idx) = s.current_digit_idx {
+                Some(s.validation_digits[digit_idx].pixels())
+            } else {
+                None
+            };
 
+            if let Some(pixels) = pixels {
                 // Draw digit scaled 5x
-                let pixels = digit.pixels();
                 for row in 0..28 {
                     for col in 0..28 {
                         let pixel_idx = row * 28 + col;
@@ -1973,6 +2423,26 @@ fn render_digit(document: &Document) -> Result<(), JsValue> {
                             ctx.set_line_width(2.0);
                             ctx.stroke_rect(col as f64 * 5.0, row as f64 * 5.0, 5.0, 5.0);
                         }
+                    }
+                }
+
+                // Draw a subtle grid in drawing mode for guidance
+                if s.drawing_mode {
+                    ctx.set_stroke_style_str("rgba(61, 90, 128, 0.2)");
+                    ctx.set_line_width(0.5);
+                    // Vertical lines every 5 pixels (1 MNIST pixel)
+                    for i in 0..=28 {
+                        ctx.begin_path();
+                        ctx.move_to(i as f64 * 5.0, 0.0);
+                        ctx.line_to(i as f64 * 5.0, 140.0);
+                        ctx.stroke();
+                    }
+                    // Horizontal lines
+                    for i in 0..=28 {
+                        ctx.begin_path();
+                        ctx.move_to(0.0, i as f64 * 5.0);
+                        ctx.line_to(140.0, i as f64 * 5.0);
+                        ctx.stroke();
                     }
                 }
             }

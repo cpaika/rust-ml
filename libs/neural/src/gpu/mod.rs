@@ -6,13 +6,11 @@
 
 use std::sync::Arc;
 
-#[cfg(feature = "gpu")]
 use wgpu;
-#[cfg(feature = "gpu")]
 use bytemuck::{Pod, Zeroable};
 
 /// Helper to wait for buffer mapping - blocking version for native
-#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 fn read_buffer_sync(device: &wgpu::Device, staging_buffer: &wgpu::Buffer, _size: u64) -> Vec<f32> {
     let buffer_slice = staging_buffer.slice(..);
 
@@ -31,7 +29,7 @@ fn read_buffer_sync(device: &wgpu::Device, staging_buffer: &wgpu::Buffer, _size:
 }
 
 /// Helper to wait for buffer mapping - WASM version using polling with callback check
-#[cfg(all(feature = "gpu", target_arch = "wasm32"))]
+#[cfg(target_arch = "wasm32")]
 fn read_buffer_sync(device: &wgpu::Device, staging_buffer: &wgpu::Buffer, _size: u64) -> Vec<f32> {
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -73,7 +71,7 @@ fn read_buffer_sync(device: &wgpu::Device, staging_buffer: &wgpu::Buffer, _size:
 }
 
 /// Helper to read buffer into slice - native version
-#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 fn read_buffer_into_sync(device: &wgpu::Device, staging_buffer: &wgpu::Buffer, dest: &mut [f32]) {
     let buffer_slice = staging_buffer.slice(..);
 
@@ -92,7 +90,7 @@ fn read_buffer_into_sync(device: &wgpu::Device, staging_buffer: &wgpu::Buffer, d
 }
 
 /// Helper to read buffer into slice - WASM version
-#[cfg(all(feature = "gpu", target_arch = "wasm32"))]
+#[cfg(target_arch = "wasm32")]
 fn read_buffer_into_sync(device: &wgpu::Device, staging_buffer: &wgpu::Buffer, dest: &mut [f32]) {
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -128,40 +126,26 @@ fn read_buffer_into_sync(device: &wgpu::Device, staging_buffer: &wgpu::Buffer, d
 
 /// GPU context holding the device and queue
 pub struct GpuContext {
-    #[cfg(feature = "gpu")]
     device: Arc<wgpu::Device>,
-    #[cfg(feature = "gpu")]
     queue: Arc<wgpu::Queue>,
-    #[cfg(feature = "gpu")]
     matmul_pipeline: wgpu::ComputePipeline,
-    #[cfg(feature = "gpu")]
     matmul_at_b_pipeline: wgpu::ComputePipeline,  // A^T * B for weight gradients
-    #[cfg(feature = "gpu")]
     matmul_a_bt_pipeline: wgpu::ComputePipeline,  // A * B^T for delta backprop
-    #[cfg(feature = "gpu")]
     relu_pipeline: wgpu::ComputePipeline,
-    #[cfg(feature = "gpu")]
     relu_backward_pipeline: wgpu::ComputePipeline,
-    #[cfg(feature = "gpu")]
     add_bias_pipeline: wgpu::ComputePipeline,
-    #[cfg(feature = "gpu")]
     hadamard_pipeline: wgpu::ComputePipeline,
-    #[cfg(feature = "gpu")]
     saxpy_pipeline: wgpu::ComputePipeline,  // y = alpha * x + y (for SGD updates)
-    #[cfg(feature = "gpu")]
     softmax_pipeline: wgpu::ComputePipeline,  // softmax activation for output layer
-    #[cfg(feature = "gpu")]
     output_delta_pipeline: wgpu::ComputePipeline,  // delta = softmax_output - one_hot(label)
-    #[cfg(feature = "gpu")]
     zero_buffer_pipeline: wgpu::ComputePipeline,  // set buffer to zero
-    #[cfg(feature = "gpu")]
     scale_buffer_pipeline: wgpu::ComputePipeline,  // multiply buffer by scalar
 }
 
 /// Matrix dimensions for compute shaders
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
-#[cfg_attr(feature = "gpu", derive(Pod, Zeroable))]
+#[derive(Pod, Zeroable)]
 pub struct MatrixDims {
     pub m: u32,  // rows of A, rows of C
     pub k: u32,  // cols of A, rows of B
@@ -172,7 +156,7 @@ pub struct MatrixDims {
 /// Vector dimensions for compute shaders
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
-#[cfg_attr(feature = "gpu", derive(Pod, Zeroable))]
+#[derive(Pod, Zeroable)]
 pub struct VectorDims {
     pub size: u32,
     pub _pad1: u32,
@@ -183,7 +167,7 @@ pub struct VectorDims {
 /// Scalar + vector dimensions for SAXPY (y = alpha * x + y)
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
-#[cfg_attr(feature = "gpu", derive(Pod, Zeroable))]
+#[derive(Pod, Zeroable)]
 pub struct SaxpyParams {
     pub size: u32,
     pub _pad1: u32,
@@ -194,7 +178,7 @@ pub struct SaxpyParams {
 /// Output delta params (for computing softmax - one_hot(label))
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
-#[cfg_attr(feature = "gpu", derive(Pod, Zeroable))]
+#[derive(Pod, Zeroable)]
 pub struct OutputDeltaParams {
     pub size: u32,
     pub label: u32,  // The correct class label (0-indexed)
@@ -205,7 +189,7 @@ pub struct OutputDeltaParams {
 /// Scale buffer params (for multiplying buffer by scalar)
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
-#[cfg_attr(feature = "gpu", derive(Pod, Zeroable))]
+#[derive(Pod, Zeroable)]
 pub struct ScaleParams {
     pub size: u32,
     pub _pad1: u32,
@@ -213,7 +197,6 @@ pub struct ScaleParams {
     pub _pad2: u32,
 }
 
-#[cfg(feature = "gpu")]
 impl GpuContext {
     /// Create a new GPU context (async version for WASM compatibility)
     pub async fn new_async() -> Result<Self, String> {
@@ -1068,9 +1051,9 @@ impl GpuContext {
             });
             cpass.set_pipeline(&self.matmul_pipeline);
             cpass.set_bind_group(0, &bind_group, &[]);
-            // Dispatch workgroups: ceil(m/8) x ceil(n/8)
-            let workgroups_x = (m as u32 + 7) / 8;
-            let workgroups_y = (n as u32 + 7) / 8;
+            // Dispatch workgroups: ceil(m/16) x ceil(n/16) for tiled matmul
+            let workgroups_x = (m as u32 + 15) / 16;
+            let workgroups_y = (n as u32 + 15) / 16;
             cpass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
         }
 
@@ -1315,8 +1298,9 @@ impl GpuContext {
             });
             cpass.set_pipeline(&self.matmul_at_b_pipeline);
             cpass.set_bind_group(0, &bind_group, &[]);
-            let workgroups_x = (m as u32 + 7) / 8;
-            let workgroups_y = (n as u32 + 7) / 8;
+            // Tiled matmul uses 16x16 workgroups
+            let workgroups_x = (m as u32 + 15) / 16;
+            let workgroups_y = (n as u32 + 15) / 16;
             cpass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
         }
 
@@ -1396,8 +1380,9 @@ impl GpuContext {
             });
             cpass.set_pipeline(&self.matmul_a_bt_pipeline);
             cpass.set_bind_group(0, &bind_group, &[]);
-            let workgroups_x = (m as u32 + 7) / 8;
-            let workgroups_y = (n as u32 + 7) / 8;
+            // Tiled matmul uses 16x16 workgroups
+            let workgroups_x = (m as u32 + 15) / 16;
+            let workgroups_y = (n as u32 + 15) / 16;
             cpass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
         }
 
@@ -1708,8 +1693,9 @@ impl GpuContext {
             });
             cpass.set_pipeline(&self.matmul_pipeline);
             cpass.set_bind_group(0, &bind_group, &[]);
-            let workgroups_x = (m as u32 + 7) / 8;
-            let workgroups_y = (n as u32 + 7) / 8;
+            // Tiled matmul uses 16x16 workgroups
+            let workgroups_x = (m as u32 + 15) / 16;
+            let workgroups_y = (n as u32 + 15) / 16;
             cpass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
         }
     }
@@ -1844,8 +1830,9 @@ impl GpuContext {
             });
             cpass.set_pipeline(&self.matmul_at_b_pipeline);
             cpass.set_bind_group(0, &bind_group, &[]);
-            let workgroups_x = (m as u32 + 7) / 8;
-            let workgroups_y = (n as u32 + 7) / 8;
+            // Tiled matmul uses 16x16 workgroups
+            let workgroups_x = (m as u32 + 15) / 16;
+            let workgroups_y = (n as u32 + 15) / 16;
             cpass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
         }
     }
@@ -1895,8 +1882,9 @@ impl GpuContext {
             });
             cpass.set_pipeline(&self.matmul_a_bt_pipeline);
             cpass.set_bind_group(0, &bind_group, &[]);
-            let workgroups_x = (m as u32 + 7) / 8;
-            let workgroups_y = (n as u32 + 7) / 8;
+            // Tiled matmul uses 16x16 workgroups
+            let workgroups_x = (m as u32 + 15) / 16;
+            let workgroups_y = (n as u32 + 15) / 16;
             cpass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
         }
     }
